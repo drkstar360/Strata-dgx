@@ -117,6 +117,21 @@ docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 --ulimit memlock=-
 
 Add `-e API_KEY=<secret>` before publishing the port beyond `127.0.0.1`.
 
+Or with Docker Compose (`docker-compose.spark.yml`), which keeps the data in `strata-data/` in the project root instead of a
+named volume. `.dockerignore` and `.gitignore` leave that folder out, so the model files never go into the image or into git:
+
+```sh
+mkdir -p strata-data                                      # created by you, so it is not owned by root
+docker compose -f docker-compose.spark.yml up -d --build
+docker compose -f docker-compose.spark.yml logs -f
+curl -fs http://127.0.0.1:8080/health
+```
+
+Its settings come from the environment or a `.env` file: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT`
+(`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `REINSTALL`, `STRATA_PORT` (`8080`), `BUILD_VISION` (`1`). For GGUF
+files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container runs as root, so
+the files it writes in `strata-data/` are owned by root.
+
 ## Results so far
 
 **Build.** The engine compiles and links on the Spark: an `ELF 64-bit ... ARM aarch64` executable, with GPU code for
@@ -163,7 +178,7 @@ architecture, so x86 users are not affected. On aarch64 the 121 default is set b
 
 - **A model run.** No model was downloaded. The API checks, temperature-0 output checks (code, a math answer, a 32K-token recall
   test) and decode / prompt tok/s at a short prompt and at 32K are still to do.
-- **`Dockerfile.spark`** has not been built.
+- **`Dockerfile.spark`** and **`docker-compose.spark.yml`** have not been built or run.
 - **Pinning on unified memory.** The engine page-locks tens of GB of host RAM for the GPU (`cudaHostRegister`, `mlock`). On the
   Spark host and GPU memory are one pool, so this may be pointless. Startup time, peak RSS and tok/s with the pinning as it is,
   and with less (`STRATA_RESIDENT_PIN=0`, `STRATA_ARENA_LOCK=0`, `STRATA_ARENA_PIN_GIB`), are to be measured.
