@@ -37,13 +37,17 @@ class Entrypoint(unittest.TestCase):
         self.script = self.tmp / "entry.sh"
         self.script.write_text(script, encoding="utf-8")
 
-    def run_entry(self, reinstall, **extra):
+    def run_entry(self, reinstall, rc=0, **extra):
         env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
-        env.pop("MODEL_ALIASES", None)                               # only what the test sets
+        for k in ("MODEL_ALIASES", "EXPERT_CACHE"):                  # only what the test sets
+            env.pop(k, None)
         env.update(extra)
         r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        return r.stdout
+        if rc == 0:
+            self.assertEqual(r.returncode, 0, r.stderr)
+        else:
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+        return r.stdout + r.stderr
 
     def test_edited_volume_config_wins_over_a_regular_file_in_opt(self):
         (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["edited", "--kv-resident", "32768"]}\n')
@@ -81,6 +85,30 @@ class Entrypoint(unittest.TestCase):
         self.assertEqual(got["aliases"], ["gpt-local"])
         self.assertEqual(got["sampling"], {"temperature": 0.6})
         self.assertTrue((self.opt / "strata-iq3_s.json").is_symlink())   # still the link, not a copy
+
+    def test_expert_cache_replaces_the_engine_argument(self):
+        cfg = self.data / "config" / "strata-iq3_s.json"
+        cfg.write_text('{"args": ["--native", "m.gguf", "--expert-cache", "auto", "--serve"], "aliases": ["kept"]}\n')
+        self.run_entry("0", EXPERT_CACHE="4000")
+        got = json.loads(cfg.read_text())
+        self.assertEqual(got["args"], ["--native", "m.gguf", "--expert-cache", "4000", "--serve"])
+        self.assertEqual(got["aliases"], ["kept"])                   # MODEL_ALIASES unset: not touched
+
+    def test_expert_cache_is_added_when_the_config_has_none(self):
+        out = self.run_entry("0", EXPERT_CACHE="AUTO")                # first setup: the stub's args have no cache flag
+        self.assertIn("Expert cache: auto", out)
+        got = json.loads((self.data / "config" / "strata-iq3_s.json").read_text())
+        self.assertEqual(got["args"], ["from-setup", "--expert-cache", "auto"])
+
+    def test_bad_expert_cache_stops_the_start_and_changes_nothing(self):
+        cfg = self.data / "config" / "strata-iq3_s.json"
+        text = '{"args": ["--expert-cache", "auto"]}\n'
+        cfg.write_text(text)
+        for bad in ("0", "-5", "8G", "lots"):
+            out = self.run_entry("0", rc=1, EXPERT_CACHE=bad)
+            self.assertIn("EXPERT_CACHE", out)
+            self.assertNotIn("STARTED WITH", out)
+            self.assertEqual(cfg.read_text(), text)
 
     def test_unset_model_aliases_leave_the_config_alone(self):
         cfg = self.data / "config" / "strata-iq3_s.json"

@@ -19,10 +19,10 @@ index 4f341af..2483cb0 100644
 +/.env
 diff --git a/.env.example b/.env.example
 new file mode 100644
-index 0000000..5b15950
+index 0000000..a1d6fbb
 --- /dev/null
 +++ b/.env.example
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,55 @@
 +# Settings for docker-compose.spark.yml (Strata on a DGX Spark, docs/DGX_SPARK.md).
 +# Copy this file to .env in the project root and change what you need; Docker Compose reads .env by itself:
 +#   cp .env.example .env
@@ -39,7 +39,7 @@ index 0000000..5b15950
 +# the longest conversation in tokens (prompt + answer)
 +CONTEXT=65536
 +# no | yes | cpu: reading pictures (yes needs BUILD_VISION=1)
-+VISION=no
++VISION=yes
 +# KV cache: empty (setup's default, int8) | int8 | q4_0 | k8v4
 +KV=
 +
@@ -50,6 +50,16 @@ index 0000000..5b15950
 +# 1: run setup again on the next start, to change CONTEXT, VISION, KV or API_KEY for a model already set up.
 +# Set it back to 0 afterwards
 +REINSTALL=0
++
++# ---- memory (the Spark's GPU shares the RAM: docs/DGX_SPARK.md) ----
++
++# the GPU's copy of the most-used experts (--expert-cache): empty (keep the config's, auto after setup) | auto | N.
++# auto takes the memory left after the model loads, less UMA_HEADROOM_GIB: on the Spark that is a second copy of
++# experts already in RAM, and Strata then uses nearly all memory. N is a number of slots of one expert each; the
++# engine's log says what auto chose ("expert cache auto: ... -> N slots"), so pick a smaller N from there
++EXPERT_CACHE=
++# the GiB of RAM kept for the OS and other programs when the engine sizes GPU memory (0-1024, default 6)
++UMA_HEADROOM_GIB=6
 +
 +# ---- the server ----
 +
@@ -251,10 +261,10 @@ index 10728a4..e364187 100644
      add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
 diff --git a/Dockerfile.spark b/Dockerfile.spark
 new file mode 100644
-index 0000000..3f0017e
+index 0000000..73e6941
 --- /dev/null
 +++ b/Dockerfile.spark
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,96 @@
 +# syntax=docker/dockerfile:1
 +#
 +# Strata on an NVIDIA DGX Spark (GB10 Grace Blackwell, aarch64, 128 GB unified
@@ -270,7 +280,8 @@ index 0000000..3f0017e
 +#   docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 #     --ulimit memlock=-1 -v strata-data:/data #     -e FAMILY=unsloth -e MODEL=UD-IQ4_XS strata-spark
 +#
 +# Setup choices are the env vars ./Dockerfile lists (FAMILY, MODEL, CONTEXT, VISION,
-+# KV, LOW_RAM, HOST, PORT, API_KEY, GGUF_DIR, MODEL_ALIASES, ...).  Q2_0 is not offered on ARM:
++# KV, LOW_RAM, HOST, PORT, API_KEY, GGUF_DIR, MODEL_ALIASES, EXPERT_CACHE,
++# STRATA_UMA_HEADROOM_GIB, ...).  Q2_0 is not offered on ARM:
 +# its pack needs Strata's x86 AVX-512 kernels.  Add -e API_KEY=<secret> before
 +# publishing the port beyond 127.0.0.1.
 +
@@ -389,10 +400,10 @@ index 0000000..891764f
 +endfunction()
 diff --git a/docker-compose.spark.yml b/docker-compose.spark.yml
 new file mode 100644
-index 0000000..f8b454a
+index 0000000..158af9e
 --- /dev/null
 +++ b/docker-compose.spark.yml
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,57 @@
 +# Strata on an NVIDIA DGX Spark (docs/DGX_SPARK.md), with Docker Compose.  Run from the project root, ON THE SPARK:
 +#
 +#   mkdir -p strata-data                                  # so the folder is yours, not root's
@@ -439,6 +450,9 @@ index 0000000..f8b454a
 +      GGUF_DIR: "${GGUF_DIR:-}"
 +      KV: "${KV:-}"
 +      MODEL_ALIASES: "${MODEL_ALIASES:-}"
++      EXPERT_CACHE: "${EXPERT_CACHE:-}"
++      # the GiB of RAM the engine leaves to the OS when it sizes GPU memory (the engine reads it directly)
++      STRATA_UMA_HEADROOM_GIB: "${UMA_HEADROOM_GIB:-6}"
 +      REINSTALL: "${REINSTALL:-0}"
 +    deploy:
 +      resources:
@@ -448,28 +462,48 @@ index 0000000..f8b454a
 +              count: all
 +              capabilities: [gpu]
 diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
-index 64d096b..deb2d01 100755
+index 64d096b..c2bfa6f 100755
 --- a/docker-entrypoint.sh
 +++ b/docker-entrypoint.sh
-@@ -64,6 +64,24 @@ else
+@@ -64,6 +64,44 @@ else
    ln -sfn "$cfg" "/opt/strata/strata-$tag.json"
  fi
  
-+# MODEL_ALIASES ("qwen,local-model"): other names the model answers to and /v1/models lists (the config's "aliases",
-+# docs/DETAILS.md "Model aliases"). Set, it replaces them on every start, in the config on the volume and in the one
-+# that starts (a copy after a setup pass, else the link to it); unset, the config's own aliases (the web page's) stay.
-+if [ -n "${MODEL_ALIASES:-}" ]; then
-+  python3 - "$MODEL_ALIASES" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
++# Settings applied to the model's config on every start, after any setup pass (which rewrites the engine's args), in
++# the config on the volume and in the one that starts (a copy after a setup pass, else the link to it). Unset, the
++# config's own value stays (what the web page or an earlier start wrote).
++#  MODEL_ALIASES ("qwen,local-model"): other names the model answers to and /v1/models lists (the config's "aliases",
++#    docs/DETAILS.md "Model aliases").
++#  EXPERT_CACHE (auto | N): the engine's --expert-cache, the GPU's copy of the most-used experts in slots of one expert
++#    each. auto takes the GPU memory left after the model loads; on a GPU that shares the RAM (DGX Spark) that is
++#    MemAvailable less STRATA_UMA_HEADROOM_GIB, a second copy of experts already in RAM (docs/DGX_SPARK.md).
++if [ -n "${MODEL_ALIASES:-}" ] || [ -n "${EXPERT_CACHE:-}" ]; then
++  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
 +import json, os, sys
-+names = [x.strip() for x in sys.argv[1].split(",") if x.strip()]
-+for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[2:] if os.path.isfile(p)):
++aliases, cache = sys.argv[1], sys.argv[2].strip().lower()
++if cache and cache != "auto" and not (cache.isdigit() and int(cache) > 0):
++    sys.exit(f"EXPERT_CACHE={sys.argv[2]!r}: expected auto or a whole number of slots above 0 (the engine needs a cache)")
++names = [x.strip() for x in aliases.split(",") if x.strip()]
++for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[3:] if os.path.isfile(p)):
 +    with open(path, encoding="utf-8-sig") as f:
 +        cfg = json.load(f)
-+    if cfg.get("aliases") != names:
++    old = json.dumps(cfg)
++    if aliases:
 +        cfg["aliases"] = names
++    if cache:
++        args = [str(x) for x in cfg.get("args") or []]
++        if "--expert-cache" in args[:-1]:
++            args[args.index("--expert-cache") + 1] = cache
++        else:
++            args += ["--expert-cache", cache]
++        cfg["args"] = args
++    if json.dumps(cfg) != old:
 +        with open(path, "w", encoding="utf-8") as f:
 +            f.write(json.dumps(cfg, indent=1))
-+print("Model aliases: " + (", ".join(names) or "none"))
++if aliases:
++    print("Model aliases: " + (", ".join(names) or "none"))
++if cache:
++    print("Expert cache: " + cache)
 +PYEOF
 +fi
 +
@@ -478,10 +512,10 @@ index 64d096b..deb2d01 100755
  # GPUS / GPU / LAYER_SPLIT are repeated on purpose. Given at the start they pin the
 diff --git a/docs/DGX_SPARK.md b/docs/DGX_SPARK.md
 new file mode 100644
-index 0000000..a70a9ec
+index 0000000..5eeca60
 --- /dev/null
 +++ b/docs/DGX_SPARK.md
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,233 @@
 +# NVIDIA DGX Spark (GB10, aarch64): build from source
 +
 +This fork ports Strata to the NVIDIA DGX Spark: a 20-core ARM Grace CPU (aarch64, NEON/SVE2, no x86 instructions), a Blackwell
@@ -613,13 +647,26 @@ index 0000000..a70a9ec
 +
 +Its settings come from the environment or a `.env` file in the project root: `cp .env.example .env` and edit it. The
 +example lists every setting with what it does; `.env` holds the API key, so `.gitignore` and `.dockerignore` leave it out.
-+The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT`
-+(`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `MODEL_ALIASES`, `REINSTALL`, `STRATA_PORT` (`8080`),
++The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT` (`65536`), `VISION` (`no`), `API_KEY`,
++`GGUF_DIR`, `KV`, `MODEL_ALIASES`, `EXPERT_CACHE`, `UMA_HEADROOM_GIB` (`6`), `REINSTALL`, `STRATA_PORT` (`8080`),
 +`BUILD_VISION` (`1`). `MODEL_ALIASES=qwen,local-model` gives the model other names: `/v1/models` lists them, and a
 +request naming one is answered under it. The entrypoint writes them into the config's `aliases` on every start (the
-+same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay. For GGUF
-+files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container runs as root, so
-+the files it writes in `strata-data/` are owned by root.
++same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay.
++
++For GGUF files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container
++runs as root, so the files it writes in `strata-data/` are owned by root.
++
++Two settings decide how much of the shared memory Strata takes:
++
++- `EXPERT_CACHE` (`auto` or a number of slots) is the engine's `--expert-cache`, which the entrypoint writes into the
++  config's engine arguments on every start. Left empty, the config keeps its own value (`auto` after setup).
++- `UMA_HEADROOM_GIB` (default 6) is passed to the engine as `STRATA_UMA_HEADROOM_GIB`.
++
++With `auto`, the engine sizes the cache from `device_free_bytes()`, which on the Spark is `MemAvailable` less
++`UMA_HEADROOM_GIB`, read after the model has loaded (`src/program/generate.cpp`). The cache takes all of that, up to the
++number of experts the profile lists. So by default Strata should use nearly all memory but the headroom. Much of the
++cache is a second copy of experts that are already in RAM, which the Spark's GPU can read directly. This is read from
++the code, not measured; see "Not done yet".
 +
 +## Applying the port to a newer upstream
 +
@@ -697,7 +744,7 @@ index 0000000..a70a9ec
 +- **The expert cache on unified memory.** `device_free_bytes()` already counts `MemAvailable` less `STRATA_UMA_HEADROOM_GIB`
 +  (default 6) for any integrated GPU on Linux, on the CUDA path too (`src/core/expert_cache.cpp`, read, not measured). So
 +  `--expert-cache auto` may copy experts that are already in the same RAM. Whether that helps or only uses memory is to be
-+  measured.
++  measured: memory use and tok/s with `EXPERT_CACHE` at auto, at a few slot counts, and with more `UMA_HEADROOM_GIB`.
 +- **The mixed cores.** The 20 cores are 10 Cortex-X925 and 10 Cortex-A725, and the expert pool pins one worker per core. CPU expert
 +  work may wait on the slower cores. Not measured.
 +- **Q2_0 as a native GGUF.** ggml has a NEON Q2_0 dot product, so the native Q2_0 GGUF (not the canonical pack) may run. Setup
@@ -1180,7 +1227,7 @@ index a78d088..5efb2df 100644
      int64_t K = 10;
      // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
 diff --git a/tools/test_docker_entrypoint.py b/tools/test_docker_entrypoint.py
-index 3e185a6..a6af02e 100644
+index 3e185a6..af18f11 100644
 --- a/tools/test_docker_entrypoint.py
 +++ b/tools/test_docker_entrypoint.py
 @@ -7,6 +7,7 @@ Windows).
@@ -1191,19 +1238,28 @@ index 3e185a6..a6af02e 100644
  import os
  import shutil
  import subprocess
-@@ -36,8 +37,10 @@ class Entrypoint(unittest.TestCase):
+@@ -36,11 +37,17 @@ class Entrypoint(unittest.TestCase):
          self.script = self.tmp / "entry.sh"
          self.script.write_text(script, encoding="utf-8")
  
 -    def run_entry(self, reinstall):
-+    def run_entry(self, reinstall, **extra):
++    def run_entry(self, reinstall, rc=0, **extra):
          env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
-+        env.pop("MODEL_ALIASES", None)                               # only what the test sets
++        for k in ("MODEL_ALIASES", "EXPERT_CACHE"):                  # only what the test sets
++            env.pop(k, None)
 +        env.update(extra)
          r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
-         self.assertEqual(r.returncode, 0, r.stderr)
-         return r.stdout
-@@ -62,6 +65,30 @@ class Entrypoint(unittest.TestCase):
+-        self.assertEqual(r.returncode, 0, r.stderr)
+-        return r.stdout
++        if rc == 0:
++            self.assertEqual(r.returncode, 0, r.stderr)
++        else:
++            self.assertNotEqual(r.returncode, 0, r.stdout)
++        return r.stdout + r.stderr
+ 
+     def test_edited_volume_config_wins_over_a_regular_file_in_opt(self):
+         (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["edited", "--kv-resident", "32768"]}\n')
+@@ -62,6 +69,54 @@ class Entrypoint(unittest.TestCase):
          cfg.write_text('{"args": ["edited-later"]}\n')
          self.assertIn("edited-later", self.run_entry("0"))           # the regular file setup left is replaced by the link
  
@@ -1223,6 +1279,30 @@ index 3e185a6..a6af02e 100644
 +        self.assertEqual(got["aliases"], ["gpt-local"])
 +        self.assertEqual(got["sampling"], {"temperature": 0.6})
 +        self.assertTrue((self.opt / "strata-iq3_s.json").is_symlink())   # still the link, not a copy
++
++    def test_expert_cache_replaces_the_engine_argument(self):
++        cfg = self.data / "config" / "strata-iq3_s.json"
++        cfg.write_text('{"args": ["--native", "m.gguf", "--expert-cache", "auto", "--serve"], "aliases": ["kept"]}\n')
++        self.run_entry("0", EXPERT_CACHE="4000")
++        got = json.loads(cfg.read_text())
++        self.assertEqual(got["args"], ["--native", "m.gguf", "--expert-cache", "4000", "--serve"])
++        self.assertEqual(got["aliases"], ["kept"])                   # MODEL_ALIASES unset: not touched
++
++    def test_expert_cache_is_added_when_the_config_has_none(self):
++        out = self.run_entry("0", EXPERT_CACHE="AUTO")                # first setup: the stub's args have no cache flag
++        self.assertIn("Expert cache: auto", out)
++        got = json.loads((self.data / "config" / "strata-iq3_s.json").read_text())
++        self.assertEqual(got["args"], ["from-setup", "--expert-cache", "auto"])
++
++    def test_bad_expert_cache_stops_the_start_and_changes_nothing(self):
++        cfg = self.data / "config" / "strata-iq3_s.json"
++        text = '{"args": ["--expert-cache", "auto"]}\n'
++        cfg.write_text(text)
++        for bad in ("0", "-5", "8G", "lots"):
++            out = self.run_entry("0", rc=1, EXPERT_CACHE=bad)
++            self.assertIn("EXPERT_CACHE", out)
++            self.assertNotIn("STARTED WITH", out)
++            self.assertEqual(cfg.read_text(), text)
 +
 +    def test_unset_model_aliases_leave_the_config_alone(self):
 +        cfg = self.data / "config" / "strata-iq3_s.json"

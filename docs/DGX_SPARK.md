@@ -129,13 +129,26 @@ curl -fs http://127.0.0.1:8080/health
 
 Its settings come from the environment or a `.env` file in the project root: `cp .env.example .env` and edit it. The
 example lists every setting with what it does; `.env` holds the API key, so `.gitignore` and `.dockerignore` leave it out.
-The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT`
-(`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `MODEL_ALIASES`, `REINSTALL`, `STRATA_PORT` (`8080`),
+The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT` (`65536`), `VISION` (`no`), `API_KEY`,
+`GGUF_DIR`, `KV`, `MODEL_ALIASES`, `EXPERT_CACHE`, `UMA_HEADROOM_GIB` (`6`), `REINSTALL`, `STRATA_PORT` (`8080`),
 `BUILD_VISION` (`1`). `MODEL_ALIASES=qwen,local-model` gives the model other names: `/v1/models` lists them, and a
 request naming one is answered under it. The entrypoint writes them into the config's `aliases` on every start (the
-same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay. For GGUF
-files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container runs as root, so
-the files it writes in `strata-data/` are owned by root.
+same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay.
+
+For GGUF files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container
+runs as root, so the files it writes in `strata-data/` are owned by root.
+
+Two settings decide how much of the shared memory Strata takes:
+
+- `EXPERT_CACHE` (`auto` or a number of slots) is the engine's `--expert-cache`, which the entrypoint writes into the
+  config's engine arguments on every start. Left empty, the config keeps its own value (`auto` after setup).
+- `UMA_HEADROOM_GIB` (default 6) is passed to the engine as `STRATA_UMA_HEADROOM_GIB`.
+
+With `auto`, the engine sizes the cache from `device_free_bytes()`, which on the Spark is `MemAvailable` less
+`UMA_HEADROOM_GIB`, read after the model has loaded (`src/program/generate.cpp`). The cache takes all of that, up to the
+number of experts the profile lists. So by default Strata should use nearly all memory but the headroom. Much of the
+cache is a second copy of experts that are already in RAM, which the Spark's GPU can read directly. This is read from
+the code, not measured; see "Not done yet".
 
 ## Applying the port to a newer upstream
 
@@ -213,7 +226,7 @@ architecture, so x86 users are not affected. On aarch64 the 121 default is set b
 - **The expert cache on unified memory.** `device_free_bytes()` already counts `MemAvailable` less `STRATA_UMA_HEADROOM_GIB`
   (default 6) for any integrated GPU on Linux, on the CUDA path too (`src/core/expert_cache.cpp`, read, not measured). So
   `--expert-cache auto` may copy experts that are already in the same RAM. Whether that helps or only uses memory is to be
-  measured.
+  measured: memory use and tok/s with `EXPERT_CACHE` at auto, at a few slot counts, and with more `UMA_HEADROOM_GIB`.
 - **The mixed cores.** The 20 cores are 10 Cortex-X925 and 10 Cortex-A725, and the expert pool pins one worker per core. CPU expert
   work may wait on the slower cores. Not measured.
 - **Q2_0 as a native GGUF.** ggml has a NEON Q2_0 dot product, so the native Q2_0 GGUF (not the canonical pack) may run. Setup
