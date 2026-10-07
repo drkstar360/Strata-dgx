@@ -64,6 +64,24 @@ else
   ln -sfn "$cfg" "/opt/strata/strata-$tag.json"
 fi
 
+# MODEL_ALIASES ("qwen,local-model"): other names the model answers to and /v1/models lists (the config's "aliases",
+# docs/DETAILS.md "Model aliases"). Set, it replaces them on every start, in the config on the volume and in the one
+# that starts (a copy after a setup pass, else the link to it); unset, the config's own aliases (the web page's) stay.
+if [ -n "${MODEL_ALIASES:-}" ]; then
+  python3 - "$MODEL_ALIASES" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
+import json, os, sys
+names = [x.strip() for x in sys.argv[1].split(",") if x.strip()]
+for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[2:] if os.path.isfile(p)):
+    with open(path, encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    if cfg.get("aliases") != names:
+        cfg["aliases"] = names
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, indent=1))
+print("Model aliases: " + (", ".join(names) or "none"))
+PYEOF
+fi
+
 # Later starts skip straight here: setup.py finds the installed config and
 # launches serve/server.py (OpenAI- and Anthropic-compatible API on :8080).
 # GPUS / GPU / LAYER_SPLIT are repeated on purpose. Given at the start they pin the

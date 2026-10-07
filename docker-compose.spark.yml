@@ -43,6 +43,7 @@ services:
       API_KEY: "${API_KEY:-}"
       GGUF_DIR: "${GGUF_DIR:-}"
       KV: "${KV:-}"
+      MODEL_ALIASES: "${MODEL_ALIASES:-}"
       REINSTALL: "${REINSTALL:-0}"
     deploy:
       resources:

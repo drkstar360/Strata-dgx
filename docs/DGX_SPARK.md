@@ -130,7 +130,10 @@ curl -fs http://127.0.0.1:8080/health
 Its settings come from the environment or a `.env` file in the project root: `cp .env.example .env` and edit it. The
 example lists every setting with what it does; `.env` holds the API key, so `.gitignore` and `.dockerignore` leave it out.
 The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT`
-(`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `REINSTALL`, `STRATA_PORT` (`8080`), `BUILD_VISION` (`1`). For GGUF
+(`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `MODEL_ALIASES`, `REINSTALL`, `STRATA_PORT` (`8080`),
+`BUILD_VISION` (`1`). `MODEL_ALIASES=qwen,local-model` gives the model other names: `/v1/models` lists them, and a
+request naming one is answered under it. The entrypoint writes them into the config's `aliases` on every start (the
+same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay. For GGUF
 files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container runs as root, so
 the files it writes in `strata-data/` are owned by root.
 
