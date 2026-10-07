@@ -132,6 +132,29 @@ Its settings come from the environment or a `.env` file: `FAMILY` (default `unsl
 files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container runs as root, so
 the files it writes in `strata-data/` are owned by root.
 
+## Applying the port to a newer upstream
+
+`patches/dgx-spark.patch` is the whole port as one patch against upstream `main` (Niko1221/Strata). It holds every change
+listed above, this document included. Applied to upstream commit `e8ca9af` it gives exactly this fork's tree.
+
+On a fresh upstream checkout:
+
+```sh
+git clone https://github.com/Niko1221/Strata.git && cd Strata
+git apply --3way /path/to/dgx-spark.patch
+git status                       # every file it touched; a conflict is marked in the file like a merge conflict
+```
+
+`--3way` falls back to a three-way merge where upstream has changed the same lines since. That works because the patch
+names the upstream file versions it was made from, which every upstream clone has.
+
+In this fork, merging upstream keeps the history and is usually simpler: `git fetch upstream && git merge upstream/main`.
+Afterwards, regenerate the patch so it matches the new upstream (it leaves `patches/` itself out):
+
+```sh
+git diff --binary upstream/main main -- . ':(exclude)patches' > patches/dgx-spark.patch
+```
+
 ## Results so far
 
 **Build.** The engine compiles and links on the Spark: an `ELF 64-bit ... ARM aarch64` executable, with GPU code for
