@@ -19,10 +19,10 @@ index 4f341af..2483cb0 100644
 +/.env
 diff --git a/.env.example b/.env.example
 new file mode 100644
-index 0000000..7a7ee04
+index 0000000..5b15950
 --- /dev/null
 +++ b/.env.example
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,45 @@
 +# Settings for docker-compose.spark.yml (Strata on a DGX Spark, docs/DGX_SPARK.md).
 +# Copy this file to .env in the project root and change what you need; Docker Compose reads .env by itself:
 +#   cp .env.example .env
@@ -52,6 +52,11 @@ index 0000000..7a7ee04
 +REINSTALL=0
 +
 +# ---- the server ----
++
++# other names the model answers to and /v1/models lists, comma-separated (its own name stays, for example
++# qwen3.8-flash-next-unsloth-ud-iq4_xs). A request naming an alias is answered under that name. Set, it replaces the
++# config's aliases on every start; empty, the config's own (set in the web page's About tab) are kept
++MODEL_ALIASES=
 +
 +# required by every /v1 request when set (Authorization: Bearer <key>, or an x-api-key header). Set it before
 +# opening the port to a network
@@ -246,7 +251,7 @@ index 10728a4..e364187 100644
      add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
 diff --git a/Dockerfile.spark b/Dockerfile.spark
 new file mode 100644
-index 0000000..acae7a3
+index 0000000..3f0017e
 --- /dev/null
 +++ b/Dockerfile.spark
 @@ -0,0 +1,95 @@
@@ -265,7 +270,7 @@ index 0000000..acae7a3
 +#   docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 #     --ulimit memlock=-1 -v strata-data:/data #     -e FAMILY=unsloth -e MODEL=UD-IQ4_XS strata-spark
 +#
 +# Setup choices are the env vars ./Dockerfile lists (FAMILY, MODEL, CONTEXT, VISION,
-+# KV, LOW_RAM, HOST, PORT, API_KEY, GGUF_DIR, ...).  Q2_0 is not offered on ARM:
++# KV, LOW_RAM, HOST, PORT, API_KEY, GGUF_DIR, MODEL_ALIASES, ...).  Q2_0 is not offered on ARM:
 +# its pack needs Strata's x86 AVX-512 kernels.  Add -e API_KEY=<secret> before
 +# publishing the port beyond 127.0.0.1.
 +
@@ -384,10 +389,10 @@ index 0000000..891764f
 +endfunction()
 diff --git a/docker-compose.spark.yml b/docker-compose.spark.yml
 new file mode 100644
-index 0000000..a8a16e6
+index 0000000..f8b454a
 --- /dev/null
 +++ b/docker-compose.spark.yml
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,54 @@
 +# Strata on an NVIDIA DGX Spark (docs/DGX_SPARK.md), with Docker Compose.  Run from the project root, ON THE SPARK:
 +#
 +#   mkdir -p strata-data                                  # so the folder is yours, not root's
@@ -433,6 +438,7 @@ index 0000000..a8a16e6
 +      API_KEY: "${API_KEY:-}"
 +      GGUF_DIR: "${GGUF_DIR:-}"
 +      KV: "${KV:-}"
++      MODEL_ALIASES: "${MODEL_ALIASES:-}"
 +      REINSTALL: "${REINSTALL:-0}"
 +    deploy:
 +      resources:
@@ -441,12 +447,41 @@ index 0000000..a8a16e6
 +            - driver: nvidia
 +              count: all
 +              capabilities: [gpu]
+diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
+index 64d096b..deb2d01 100755
+--- a/docker-entrypoint.sh
++++ b/docker-entrypoint.sh
+@@ -64,6 +64,24 @@ else
+   ln -sfn "$cfg" "/opt/strata/strata-$tag.json"
+ fi
+ 
++# MODEL_ALIASES ("qwen,local-model"): other names the model answers to and /v1/models lists (the config's "aliases",
++# docs/DETAILS.md "Model aliases"). Set, it replaces them on every start, in the config on the volume and in the one
++# that starts (a copy after a setup pass, else the link to it); unset, the config's own aliases (the web page's) stay.
++if [ -n "${MODEL_ALIASES:-}" ]; then
++  python3 - "$MODEL_ALIASES" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
++import json, os, sys
++names = [x.strip() for x in sys.argv[1].split(",") if x.strip()]
++for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[2:] if os.path.isfile(p)):
++    with open(path, encoding="utf-8-sig") as f:
++        cfg = json.load(f)
++    if cfg.get("aliases") != names:
++        cfg["aliases"] = names
++        with open(path, "w", encoding="utf-8") as f:
++            f.write(json.dumps(cfg, indent=1))
++print("Model aliases: " + (", ".join(names) or "none"))
++PYEOF
++fi
++
+ # Later starts skip straight here: setup.py finds the installed config and
+ # launches serve/server.py (OpenAI- and Anthropic-compatible API on :8080).
+ # GPUS / GPU / LAYER_SPLIT are repeated on purpose. Given at the start they pin the
 diff --git a/docs/DGX_SPARK.md b/docs/DGX_SPARK.md
 new file mode 100644
-index 0000000..c59b3f0
+index 0000000..a70a9ec
 --- /dev/null
 +++ b/docs/DGX_SPARK.md
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,220 @@
 +# NVIDIA DGX Spark (GB10, aarch64): build from source
 +
 +This fork ports Strata to the NVIDIA DGX Spark: a 20-core ARM Grace CPU (aarch64, NEON/SVE2, no x86 instructions), a Blackwell
@@ -579,7 +614,10 @@ index 0000000..c59b3f0
 +Its settings come from the environment or a `.env` file in the project root: `cp .env.example .env` and edit it. The
 +example lists every setting with what it does; `.env` holds the API key, so `.gitignore` and `.dockerignore` leave it out.
 +The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT`
-+(`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `REINSTALL`, `STRATA_PORT` (`8080`), `BUILD_VISION` (`1`). For GGUF
++(`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `MODEL_ALIASES`, `REINSTALL`, `STRATA_PORT` (`8080`),
++`BUILD_VISION` (`1`). `MODEL_ALIASES=qwen,local-model` gives the model other names: `/v1/models` lists them, and a
++request naming one is answered under it. The entrypoint writes them into the config's `aliases` on every start (the
++same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay. For GGUF
 +files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container runs as root, so
 +the files it writes in `strata-data/` are owned by root.
 +
@@ -1141,6 +1179,61 @@ index a78d088..5efb2df 100644
      strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
      int64_t K = 10;
      // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
+diff --git a/tools/test_docker_entrypoint.py b/tools/test_docker_entrypoint.py
+index 3e185a6..a6af02e 100644
+--- a/tools/test_docker_entrypoint.py
++++ b/tools/test_docker_entrypoint.py
+@@ -7,6 +7,7 @@ Windows).
+ """
+ from __future__ import annotations
+ 
++import json
+ import os
+ import shutil
+ import subprocess
+@@ -36,8 +37,10 @@ class Entrypoint(unittest.TestCase):
+         self.script = self.tmp / "entry.sh"
+         self.script.write_text(script, encoding="utf-8")
+ 
+-    def run_entry(self, reinstall):
++    def run_entry(self, reinstall, **extra):
+         env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
++        env.pop("MODEL_ALIASES", None)                               # only what the test sets
++        env.update(extra)
+         r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
+         self.assertEqual(r.returncode, 0, r.stderr)
+         return r.stdout
+@@ -62,6 +65,30 @@ class Entrypoint(unittest.TestCase):
+         cfg.write_text('{"args": ["edited-later"]}\n')
+         self.assertIn("edited-later", self.run_entry("0"))           # the regular file setup left is replaced by the link
+ 
++    def test_model_aliases_reach_the_config_that_starts_on_the_first_setup(self):
++        out = self.run_entry("0", MODEL_ALIASES=" qwen, local-model ,")
++        self.assertIn('"aliases": [', out)                           # the copy setup left in opt, which starts now
++        self.assertIn('"local-model"', out)
++        cfg = json.loads((self.data / "config" / "strata-iq3_s.json").read_text())
++        self.assertEqual(cfg["aliases"], ["qwen", "local-model"])
++        self.assertEqual(cfg["args"], ["from-setup"])               # the rest of the config is kept
++
++    def test_model_aliases_replace_the_volume_configs(self):
++        cfg = self.data / "config" / "strata-iq3_s.json"
++        cfg.write_text('{"args": ["on-volume"], "aliases": ["old"], "sampling": {"temperature": 0.6}}\n')
++        self.run_entry("0", MODEL_ALIASES="gpt-local")
++        got = json.loads(cfg.read_text())
++        self.assertEqual(got["aliases"], ["gpt-local"])
++        self.assertEqual(got["sampling"], {"temperature": 0.6})
++        self.assertTrue((self.opt / "strata-iq3_s.json").is_symlink())   # still the link, not a copy
++
++    def test_unset_model_aliases_leave_the_config_alone(self):
++        cfg = self.data / "config" / "strata-iq3_s.json"
++        text = '{"args": ["on-volume"], "aliases": ["from-web-page"]}\n'
++        cfg.write_text(text)
++        self.run_entry("0")
++        self.assertEqual(cfg.read_text(), text)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
 diff --git a/tools/test_setup_arm64.py b/tools/test_setup_arm64.py
 new file mode 100644
 index 0000000..9442b5e
