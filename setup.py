@@ -59,6 +59,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
+# an ARM CPU (the DGX Spark, docs/DGX_SPARK.md): no ready-made engine, so it is always compiled here, with ggml-cpu for
+# the CPU's experts (Strata's own CPU kernels are x86); its GPU shares the RAM (nvidia_apply_uma)
+ARM64 = platform.machine().lower() in ("aarch64", "arm64")
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
 # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
@@ -608,6 +611,10 @@ def cpu_info():
         n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
         name = n or name
         avx512 = bool(pf(41)) and _cpuid_avx512_full()
+    elif ARM64:
+        # /proc/cpuinfo on ARM has no "flags" and no model name, only part numbers; lscpu names the cores
+        names = re.findall(r"^\s*Model name:\s*(.+?)\s*$", out(["lscpu"]), re.M)
+        name = " + ".join(dict.fromkeys(names)) or "ARM64 CPU"
     else:
         try:
             txt = open("/proc/cpuinfo").read()
@@ -646,6 +653,8 @@ def cpu_floor(avx2: bool) -> str:
     """The experimental older-CPU build this PC needs (#394 #595 #623): "" with AVX2 (the normal engine), "avx" (Sandy /
     Ivy Bridge, AMD Bulldozer), "none" (SSE4.2 + POPCNT: Nehalem, Westmere), or "unsupported".  STRATA_ISA_FLOOR=avx|
     none asks for that build on any PC (testing it on a newer one)."""
+    if ARM64:
+        return ""                                      # its own build (the engine's CMake), never an x86 floor
     forced = os.environ.get("STRATA_ISA_FLOOR", "").strip().lower()
     if forced in ("avx", "none"):
         return forced
@@ -733,6 +742,11 @@ def gpus():
     for line in s.strip().splitlines():
         try:
             idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
+            if ARM64 and not mem.replace(".", "", 1).isdigit():
+                # GB10 (DGX Spark): no memory of its own, nvidia-smi says [N/A]; it uses the RAM (nvidia_apply_uma)
+                found.append(nvidia_apply_uma({"index": int(idx), "name": name, "vram_gb": 0.0,
+                                               "arch": cc.replace(".", ""), "driver": drv}))
+                continue
             found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
                           "driver": drv})
         except ValueError:
@@ -1767,6 +1781,17 @@ def amd_apply_uma(g: dict, gtt_gb: float = 0.0, ram: float | None = None) -> dic
     return g
 
 
+def nvidia_apply_uma(g: dict, ram: float | None = None) -> dict:
+    """An NVIDIA GPU with no memory of its own (GB10, DGX Spark: nvidia-smi says memory.total [N/A]): the CPU and the
+    GPU share the RAM, as on Strix Halo, but with no carve-out.  The engine's device_free_bytes() counts MemAvailable
+    less the OS's share for it, so: dedicated_gb 0 (nothing beside the RAM for the low-RAM mode), vram_gb = the RAM less
+    what the OS keeps (UMA_OS_LEFT_GB), which sizes the context and the parallel slots.  Never counted twice."""
+    ram = ram_gb() if ram is None else ram
+    shared = max(0.0, ram - UMA_OS_LEFT_GB)
+    g.update({"uma": True, "dedicated_gb": 0.0, "shared_gb": shared, "vram_gb": shared})
+    return g
+
+
 def low_ram_vram(g) -> float:
     """The GPU memory the low-RAM mode may count as room beside the RAM: a discrete card's VRAM; an APU's BIOS
     carve-out only (its shared memory is the RAM itself)."""
@@ -2696,6 +2721,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
     updating: called to replace an installed engine, which starts instead when this fails (no compile).
     toolkit 12: the experimental CUDA 12 engine (CUDA12_ASSET) in engine-cuda12/."""
+    if ARM64:
+        return None                                    # the releases are x86-64 only: compiled here (build_engine)
     eng = engine_dir(toolkit)
     asset = CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
     info = eng / "BUILD.json"
@@ -2979,7 +3006,11 @@ def install_build_tools(gpu, yes):
                 fail("the CUDA Toolkit can be installed automatically on Ubuntu 22.04 / 24.04 only",
                      "install it from https://developer.nvidia.com/cuda-downloads and run it again")
             deb = Path("/tmp/cuda-keyring.deb")
-            download(f"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu{ver}/x86_64/cuda-keyring_1.1-1_all.deb",
+            if ARM64 and nvcc is None:                 # DGX OS ships CUDA in /usr/local/cuda; never NVIDIA's x86 repo
+                fail("the CUDA Toolkit (nvcc) was not found in /usr/local/cuda*",
+                     "on a DGX Spark it comes with DGX OS: reinstall it with NVIDIA's DGX OS update, then run this again")
+            download(f"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu{ver}/"
+                     f"{'sbsa' if ARM64 else 'x86_64'}/cuda-keyring_1.1-1_all.deb",
                      deb, "CUDA repository key")
             run(["sudo", "dpkg", "-i", str(deb)])
             run(["sudo", "apt-get", "update"])
@@ -4736,7 +4767,9 @@ def main() -> int:
         gpu["archs"] = sorted({x["arch"] for x in chosen})  # the engine needs code for every one of them
         if multi:
             ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
-        ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {cc(gpu)}, driver {gpu['driver']}")
+        ok(f"GPU: {gpu['name']}, " + (f"unified memory: shares the RAM, {gpu['vram_gb']:.0f} GB usable by the GPU"
+                                       if gpu.get("uma") else f"{gpu['vram_gb']:.1f} GB VRAM")
+           + f", compute capability {cc(gpu)}, driver {gpu['driver']}" + (" (docs/DGX_SPARK.md)" if ARM64 else ""))
         cuda_tk, why = cuda_choice(gpu["archs"], a.cuda)   # one engine per model: its oldest card decides
         if why:
             (warn if cuda_tk == 13 or str(a.cuda) == "12" else ok)(f"CUDA {cuda_tk}: {why}")
@@ -4773,8 +4806,10 @@ def main() -> int:
         warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
              "the model may not start or may use less VRAM. Set it to \"System managed\": System > About > "
              "Advanced system settings > Performance > Advanced > Virtual memory")
-    ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
-    link = None if hip else pcie_link(int(gpu.get("index", 0)))
+    ok(f"CPU: {cpu} (" + ("ARM64: the engine is compiled here, its CPU experts on ggml-cpu" if ARM64 else
+                         'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2') + ")")
+    # a GPU sharing the RAM has no PCIe hop to its memory (GB10 reports a gen-1 link that means nothing)
+    link = None if hip or (ARM64 and gpu.get("uma")) else pcie_link(int(gpu.get("index", 0)))
     if link is not None:
         line, problem = pcie_lines(link)
         ok(line)
@@ -4783,7 +4818,9 @@ def main() -> int:
     floor = cpu_floor(avx2)
     if floor == "unsupported":
         fail("this CPU has neither AVX2 nor SSE4.2; Strata needs at least SSE4.2 (Intel Nehalem, 2008, or newer)")
-    if not avx2:
+    if ARM64:
+        a.build = True                                 # no ready-made ARM engine
+    elif not avx2:
         # #394 #595 #623: the ready-made engine is AVX2; an older CPU gets one compiled here, whose CPU experts run on
         # ggml-cpu's kernels for this CPU.  Experimental: measured only on newer CPUs with the older path forced, and by
         # users on a few Xeons.  A warning, not a stop.
@@ -4831,7 +4868,8 @@ def main() -> int:
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
-                + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
+                + (f"   (recommended for {'DGX Spark' if ARM64 else 'Strix Halo'}: {STRIX_HALO_MODEL})"
+                   if f == rec_fam and rec_fam != fams[0] else ""))
         family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)],
                               str(fams.index(rec_fam) + 1), a.yes)) - 1]
     fam = FAMILIES[family]
@@ -4840,6 +4878,8 @@ def main() -> int:
         say(f"  Its license: {fam['license']}")
     say()
     names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
+    if ARM64:                                          # its pack needs Strata's AVX-512 kernels (docs/DGX_SPARK.md)
+        names = [m for m in names if m != "Q2_0"]
     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
     if a.model and a.model not in names:
         # #444: say which family has that size, and (with --gguf-dir) which files Strata can run at all
