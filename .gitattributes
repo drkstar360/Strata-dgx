@@ -13,3 +13,6 @@ Dockerfile* text eol=lf
 *.py text eol=lf
 *.cmake text eol=lf
 CMakeLists.txt text eol=lf
+
+# patches/: applied byte for byte to upstream checkouts (docs/DGX_SPARK.md), never converted
+*.patch -text

@@ -1,0 +1,1196 @@
+diff --git a/.dockerignore b/.dockerignore
+index 4f341af..de0755d 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -17,6 +17,7 @@ __pycache__/
+ /mtp/
+ /models/
+ /Strata-data/
++/strata-data/
+ third_party/llama.cpp/
+ third_party/*.zip
+ *.done
+diff --git a/.gitattributes b/.gitattributes
+index 466d97e..d7f1e10 100644
+--- a/.gitattributes
++++ b/.gitattributes
+@@ -7,3 +7,12 @@ bench/prompts/** -text
+ 
+ # copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
+ tests/data/native_experts/** -text
++
++# files read on Linux (Docker builds, CMake, Python) keep LF even from a Windows clone with autocrlf
++Dockerfile* text eol=lf
++*.py text eol=lf
++*.cmake text eol=lf
++CMakeLists.txt text eol=lf
++
++# patches/: applied byte for byte to upstream checkouts (docs/DGX_SPARK.md), never converted
++*.patch -text
+diff --git a/.gitignore b/.gitignore
+index acca09f..7212cd2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -30,6 +30,7 @@ td.log
+ /build/
+ /third_party/llama.cpp
+ /models/
++/strata-data/
+ /packs/
+ /mtp/
+ /run-*.bat
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 10728a4..e364187 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -47,6 +47,21 @@ endif()
+ if(STRATA_PORTABLE AND MSVC)
+   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+ endif()
++# aarch64 (the DGX Spark, docs/DGX_SPARK.md): compiled on the machine that runs it.  None of Strata's x86 expert kernels
++# are built; ggml-cpu computes every CPU expert row (NEON/SVE), as on the older-CPU build, and the CPU probes say no.
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
++  set(STRATA_ARM64 ON)
++  add_compile_definitions(STRATA_ARM64=1)
++  # GCC on aarch64 fuses a*b+c into one FMA by default (-ffp-contract=fast), which an x86 build without -mfma never
++  # does: host code that rounds a product and then adds (ggml's nearest_int, the parity references) then lands on the
++  # other side of a tie.  Off, the host arithmetic is the x86 build's; NEON code with explicit FMA intrinsics is not
++  # affected, nor is device code (nvcc's --fmad).
++  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>
++                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
++  if(STRATA_PORTABLE OR STRATA_ISA_FLOOR)
++    message(FATAL_ERROR "STRATA_PORTABLE and STRATA_ISA_FLOOR are x86 builds; on aarch64 leave both unset")
++  endif()
++endif()
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+@@ -144,6 +159,10 @@ elseif(STRATA_ENABLE_CUDA)
+   if(MSVC AND STRATA_EXPERIMENTAL_SM60 AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
+     set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+   endif()
++  # aarch64: before enable_language(CUDA), which otherwise sets it to nvcc's default (75 for CUDA 13)
++  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND STRATA_ARM64)
++    set(CMAKE_CUDA_ARCHITECTURES 121 CACHE STRING "CUDA architectures" FORCE)    # GB10 (DGX Spark)
++  endif()
+   enable_language(CUDA)
+   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
+   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
+@@ -1078,6 +1097,12 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
+ endif()
+ 
++if(STRATA_ARM64)
++# the pool and the CPU probe only; x86_kernels_absent.cpp answers for the x86 kernels the engine checks for at run time
++add_library(strata_kernels_cpu STATIC src/kernels/cpu/pool.cpp src/kernels/cpu/expert_layout.cpp
++            src/kernels/cpu/x86_kernels_absent.cpp)
++target_include_directories(strata_kernels_cpu PUBLIC include)
++else()
+ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+ target_include_directories(strata_kernels_cpu PUBLIC include)
+@@ -1120,6 +1145,7 @@ else()
+   set(_strata_avxvnni STRATA_AVXVNNI=0)
+ endif()
+ set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
++endif()
+ find_package(Threads REQUIRED)
+ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
+ 
+@@ -1166,6 +1192,9 @@ if(STRATA_NATIVE_EXPERTS)
+                GGML_AVX512_BF16 GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16)
+       set(${_f} OFF CACHE BOOL "" FORCE)
+     endforeach()
++  elseif(STRATA_ARM64)
++    include(cmake/arm_arch.cmake)    # GCC 13's -mcpu=native is plain ARMv8 on GB10
++    strata_arm_ggml_arch()
+   else()
+     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
+   endif()
+@@ -1185,6 +1214,10 @@ if(STRATA_NATIVE_EXPERTS)
+   endif()
+   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
+   # one-pass static linking has no cycle to resolve)
++  if(STRATA_ARM64)
++  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
++  target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
++  else()
+   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
+                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
+                                            src/kernels/cpu/kq_avx1.cpp)
+@@ -1203,6 +1236,7 @@ if(STRATA_NATIVE_EXPERTS)
+     set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
+   endif()
+   set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
++  endif()
+   if(STRATA_ISA_FLOOR STREQUAL "avx")
+     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_AVX=1)
+   elseif(STRATA_ISA_FLOOR STREQUAL "none")
+@@ -1217,16 +1251,21 @@ if(STRATA_NATIVE_EXPERTS)
+     add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
+   endif()
+   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
++  if(NOT STRATA_ARM64)    # these three parity programs test x86 kernels only
+   add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)
+   target_link_libraries(router_dot_parity PRIVATE strata_kernels_cpu)
++  endif()
+   if(STRATA_BUILD_TESTS)
+     add_executable(pool_tasks_test src/kernels/cpu/pool_tasks_test.cpp)
+     target_link_libraries(pool_tasks_test PRIVATE strata_kernels_cpu)
+     add_test(NAME pool_tasks_test COMMAND pool_tasks_test)
+     set_tests_properties(pool_tasks_test PROPERTIES TIMEOUT 180)
++    if(NOT STRATA_ARM64)
+     add_test(NAME router_dot_parity COMMAND router_dot_parity)
+     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
++    endif()
+   endif()
++  if(NOT STRATA_ARM64)
+   # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..8 tokens and
+   # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
+   add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
+@@ -1242,6 +1281,7 @@ if(STRATA_NATIVE_EXPERTS)
+     add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
+     add_test(NAME q8k_quant_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:q8k_quant_parity>)
+   endif()
++  endif()
+   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
+   if(STRATA_ORCA_Q4KS_MMQ)
+@@ -1451,9 +1491,11 @@ if(STRATA_BUILD_TESTS)
+     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+   endif()
+ 
++  if(NOT STRATA_ARM64)    # the AVX-512 S2 expert kernels (expert.cpp), not built on aarch64
+   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
+   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
+   add_test(NAME expert_multi_test COMMAND expert_multi_test)
++  endif()
+ 
+   # PR #706: the opt-in AVX-2 Q2_0 bit-plane kernel (STRATA_Q2_BITPLANE=1) against the legacy one, bitwise alone/window
+   if(STRATA_BUILD_TESTS AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x64|X86")
+@@ -1463,6 +1505,7 @@ if(STRATA_BUILD_TESTS)
+     set_tests_properties(q2_bitplane_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
+   endif()
+ 
++  if(NOT STRATA_ARM64)    # the AVX-512 S2 expert kernels (expert.cpp), not built on aarch64
+   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
+   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)
+   # The pack is a REQUIRED input, not an optional one: this test compares against a real expert blob, and a
+@@ -1477,6 +1520,7 @@ if(STRATA_BUILD_TESTS)
+   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
+   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
+   add_test(NAME pool_stress COMMAND pool_stress 20)
++  endif()
+ 
+   if(UNIX AND NOT APPLE)
+     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
+diff --git a/Dockerfile.spark b/Dockerfile.spark
+new file mode 100644
+index 0000000..acae7a3
+--- /dev/null
++++ b/Dockerfile.spark
+@@ -0,0 +1,95 @@
++# syntax=docker/dockerfile:1
++#
++# Strata on an NVIDIA DGX Spark (GB10 Grace Blackwell, aarch64, 128 GB unified
++# memory): docs/DGX_SPARK.md.  The same image as ./Dockerfile - entrypoint, /data
++# volume, env vars - with the engine compiled for sm_121 and for the Grace CPU.
++#
++# Build it ON THE SPARK (the base image is multi-arch, so docker pulls arm64 there;
++# Docker Desktop on an x86 PC would make an amd64 image that cannot run on it):
++#   docker build -f Dockerfile.spark -t strata-spark .
++#   docker image inspect strata-spark --format '{{.Architecture}}'     # arm64
++#
++# Run (DGX OS ships the driver and the NVIDIA container runtime):
++#   docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 #     --ulimit memlock=-1 -v strata-data:/data #     -e FAMILY=unsloth -e MODEL=UD-IQ4_XS strata-spark
++#
++# Setup choices are the env vars ./Dockerfile lists (FAMILY, MODEL, CONTEXT, VISION,
++# KV, LOW_RAM, HOST, PORT, API_KEY, GGUF_DIR, ...).  Q2_0 is not offered on ARM:
++# its pack needs Strata's x86 AVX-512 kernels.  Add -e API_KEY=<secret> before
++# publishing the port beyond 127.0.0.1.
++
++FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
++
++# STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1
++# and docker stop's SIGTERM reaches it (see setup.start). Normal Linux starts, which
++# don't set it, keep spawning the server as a child.
++ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 STRATA_EXECV=1
++
++RUN apt-get update && apt-get install -y --no-install-recommends \
++        build-essential ca-certificates curl git libatomic1 libgomp1 \
++        python3 python3-pip python3-venv unzip \
++    && rm -rf /var/lib/apt/lists/*
++
++WORKDIR /opt/strata
++COPY . .
++
++# GB10 is compute capability 12.1. BUILD_VISION=0 skips the image encoder build.
++ARG CUDA_ARCHITECTURES=121
++ARG BUILD_VISION=1
++
++RUN python3 -m venv .venv \
++    && .venv/bin/pip install --no-cache-dir --upgrade pip \
++    && .venv/bin/pip install --no-cache-dir -r requirements.txt \
++    && chmod +x setup.sh docker-entrypoint.sh
++
++# llama.cpp at the pinned commit, then the engine and the image encoder, built
++# exactly the way setup.py builds them: native code for the CPU that builds the
++# image (ggml-cpu's -march from its /proc/cpuinfo, cmake/arm_arch.cmake), so build
++# it on the Spark it runs on. BUILD.json is what setup.py reads to
++# decide whether an engine is current: source=local with a matching src hash
++# means the first start reuses it instead of recompiling.
++RUN .venv/bin/python - <<'PYEOF'
++import json, os, pathlib, shutil
++import setup
++
++llama = setup.get_llama_cpp()
++nvcc, _ = setup.find_nvcc()
++arch = os.environ.get("CUDA_ARCHITECTURES", "121").strip().strip('"').replace(",", ";")
++vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
++
++setup.cmake_build(setup.ROOT, setup.ROOT / "build", "strata",
++    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF",
++     f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
++     f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
++if vision != "none":
++    setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision", "strata-vision",
++        [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", "-DSTRATA_PORTABLE=OFF",
++         f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}"], None, "build-vision.bat")
++
++eng = setup.ROOT / "engine"
++eng.mkdir(exist_ok=True)
++shutil.copy2(setup.ROOT / "build" / setup.EXE, eng / setup.EXE)
++if vision != "none":
++    shutil.copy2(setup.ROOT / "build-vision" / "bin" / setup.VEXE, eng / setup.VEXE)
++bindir = pathlib.Path(nvcc).parent
++meta = {"source": "local", "version": setup.source_version(),
++        "archs": [int(a.split("-")[0]) for a in arch.split(";") if a.split("-")[0].isdigit()], "vision": vision,
++        "cuda_dirs": [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()],
++        "src": setup.source_hash(setup.ENGINE_SOURCES),
++        "vision_src": setup.source_hash(setup.VISION_SOURCES) if vision != "none" else None}
++(eng / "BUILD.json").write_text(json.dumps(meta, indent=1))
++PYEOF
++
++# the cmake trees are build-time only; the engine itself is what the container needs
++RUN rm -rf build build-vision
++
++VOLUME ["/data"]
++EXPOSE 8080
++
++# /health is answered before the API key gate, so it works with or without one.
++# The port only opens after the model loads (1-3 minutes, longer on a first run),
++# so the start period is generous: a too short one marks a still-loading container
++# unhealthy and a restart policy would kill it mid-download.
++HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
++  CMD curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1
++
++ENTRYPOINT ["./docker-entrypoint.sh"]
+diff --git a/cmake/arm_arch.cmake b/cmake/arm_arch.cmake
+new file mode 100644
+index 0000000..891764f
+--- /dev/null
++++ b/cmake/arm_arch.cmake
+@@ -0,0 +1,31 @@
++# cmake/arm_arch.cmake - ggml-cpu's -march on aarch64 (docs/DGX_SPARK.md), for the engine and the vision encoder.
++#
++# GCC 13 does not know the GB10's Cortex-X925 / A725 cores: its -mcpu=native is plain ARMv8 (no dotprod, i8mm or SVE),
++# which ggml's native path keeps.  Both builds are compiled on the PC they run on, so -march is built from what this
++# CPU reports instead.  -DSTRATA_ARM_ARCH=<march> overrides it; -DSTRATA_ARM_ARCH=native keeps ggml's own detection.
++function(strata_arm_ggml_arch)
++  if(NOT DEFINED STRATA_ARM_ARCH)
++    set(_arm_arch "armv8.2-a")
++    if(EXISTS /proc/cpuinfo)
++      file(STRINGS /proc/cpuinfo _arm_features REGEX "^Features" LIMIT_COUNT 1)
++      string(REGEX REPLACE "^Features[ \t]*:[ \t]*" "" _arm_features "${_arm_features}")
++      separate_arguments(_arm_features)
++      foreach(_p "asimddp;dotprod" "asimdhp;fp16" "i8mm;i8mm" "bf16;bf16" "sve;sve" "sve2;sve2")
++        list(GET _p 0 _flag)
++        list(GET _p 1 _ext)
++        if(_flag IN_LIST _arm_features)
++          string(APPEND _arm_arch "+${_ext}")
++        endif()
++      endforeach()
++    endif()
++    set(STRATA_ARM_ARCH "${_arm_arch}" CACHE STRING "aarch64 -march for ggml-cpu (native: ggml's -mcpu=native)")
++  endif()
++  if(STRATA_ARM_ARCH STREQUAL "native")
++    message(STATUS "Strata aarch64: ggml-cpu -mcpu=native (ggml's own detection)")
++    set(GGML_NATIVE ON CACHE BOOL "" FORCE)
++  else()
++    message(STATUS "Strata aarch64: ggml-cpu -march=${STRATA_ARM_ARCH}")
++    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
++    set(GGML_CPU_ARM_ARCH "${STRATA_ARM_ARCH}" CACHE STRING "" FORCE)
++  endif()
++endfunction()
+diff --git a/docker-compose.spark.yml b/docker-compose.spark.yml
+new file mode 100644
+index 0000000..4d69764
+--- /dev/null
++++ b/docker-compose.spark.yml
+@@ -0,0 +1,53 @@
++# Strata on an NVIDIA DGX Spark (docs/DGX_SPARK.md), with Docker Compose.  Run from the project root, ON THE SPARK:
++#
++#   mkdir -p strata-data                                  # so the folder is yours, not root's
++#   docker compose -f docker-compose.spark.yml up -d --build
++#   docker compose -f docker-compose.spark.yml logs -f
++#   curl -fs http://127.0.0.1:8080/health
++#
++# The model files, the pack and the install config live in ./strata-data (the container's /data), beside the source
++# and outside the image: .dockerignore and .gitignore leave that folder out.  The first start sets the model up there
++# (UD-IQ4_XS downloads 94 GB unless GGUF_DIR points at files you already have); later starts serve straight away.
++#
++# Settings come from the environment or a .env file next to this one, for example:
++#   FAMILY=unsloth  MODEL=UD-IQ4_XS  CONTEXT=65536  VISION=no  API_KEY=<secret>  STRATA_PORT=8080
++# REINSTALL=1 changes the settings of a model that is already set up.  Q2_0 is not offered on ARM (its pack needs x86
++# AVX-512).  The port is published on 127.0.0.1 only: set API_KEY before opening it to a network.
++
++services:
++  strata:
++    build:
++      context: .
++      dockerfile: Dockerfile.spark
++      args:
++        CUDA_ARCHITECTURES: "121"
++        BUILD_VISION: "${BUILD_VISION:-1}"         # 0: no image encoder, a faster build
++    image: strata-spark
++    container_name: strata
++    restart: unless-stopped
++    ports:
++      - "127.0.0.1:${STRATA_PORT:-8080}:8080"
++    ulimits:
++      memlock:                                     # the engine locks part of the RAM for the GPU
++        soft: -1
++        hard: -1
++    volumes:
++      - ./strata-data:/data
++      # GGUF files you already have (then set GGUF_DIR=/ggufs):
++      # - /path/to/ggufs:/ggufs:ro
++    environment:
++      FAMILY: "${FAMILY:-unsloth}"
++      MODEL: "${MODEL:-UD-IQ4_XS}"
++      CONTEXT: "${CONTEXT:-65536}"
++      VISION: "${VISION:-no}"
++      API_KEY: "${API_KEY:-}"
++      GGUF_DIR: "${GGUF_DIR:-}"
++      KV: "${KV:-}"
++      REINSTALL: "${REINSTALL:-0}"
++    deploy:
++      resources:
++        reservations:
++          devices:
++            - driver: nvidia
++              count: all
++              capabilities: [gpu]
+diff --git a/docs/DGX_SPARK.md b/docs/DGX_SPARK.md
+new file mode 100644
+index 0000000..2ee2961
+--- /dev/null
++++ b/docs/DGX_SPARK.md
+@@ -0,0 +1,215 @@
++# NVIDIA DGX Spark (GB10, aarch64): build from source
++
++This fork ports Strata to the NVIDIA DGX Spark: a 20-core ARM Grace CPU (aarch64, NEON/SVE2, no x86 instructions), a Blackwell
++GB10 GPU (compute capability 12.1, `sm_121`) and 128 GB of LPDDR5X that the CPU and the GPU share. Upstream Strata targets x86-64
++CPUs with discrete GPUs; every change for the Spark sits behind an aarch64 check, so the x86 build stays as it is (checked below).
++**Status: experimental, no model run yet.** The engine and setup's own engine build and pass the tests on the Spark; the API,
++output quality and speed have not been measured. Everything here was measured on one machine, a DGX Spark running DGX OS (Ubuntu
++24.04.5), driver 580.178.04, CUDA 13.0.88, GCC 13.3.0, on 2026-10-08.
++
++## What the Spark reports
++
++| Query | Result |
++| --- | --- |
++| `uname -m` | `aarch64` |
++| `free -g` | 121 GiB total, 119 GiB available (nothing else running) |
++| `nvidia-smi --query-gpu=index,name,memory.total,compute_cap,driver_version` | `0, NVIDIA GB10, [N/A], 12.1, 580.178.04` |
++| `nvidia-smi --query-gpu=memory.used,memory.free` | `[N/A], [N/A]` |
++| `nvidia-smi` memory column | `Not Supported` |
++| `nvidia-smi --query-gpu=pcie.link.gen.max,pcie.link.gen.gpumax,pcie.link.gen.hostmax` | `1, 5, 5` (no PCIe hop between CPU and GPU memory, so meaningless here) |
++| `nvcc --version` | 13.0, V13.0.88, at `/usr/local/cuda/bin` (not on `PATH`) |
++| CPU parts (`/proc/cpuinfo`) | `0xd85` Cortex-X925 and `0xd87` Cortex-A725, 20 cores |
++| CPU features | `asimd asimddp sve sve2 i8mm bf16 svei8mm svebf16 asimdhp fphp ...` (no `flags` line, no model name) |
++| Compilers | gcc/g++ 13.3.0, clang++ 15 and 18 |
++| CMake / Ninja / Python | 3.28.3 / system ninja / 3.12.3 |
++| Docker | 29.6.2, `nvidia` runtime installed |
++| `ulimit -l` | unlimited |
++
++CUDA 13.0 is the toolkit DGX OS ships, and the one to use: upstream documents CUDA 13.2.0 / 13.2.1 (nvcc 13.2.51) miscompiling
++Blackwell sm_120 kernels.
++
++## What the port changes
++
++**The engine (CMake and C++).** On aarch64 (`CMAKE_SYSTEM_PROCESSOR` aarch64/arm64, which defines `STRATA_ARM64=1` for every
++target):
++
++- None of Strata's x86 CPU kernels are compiled: `expert.cpp`, `q2_avx2.cpp`, `iq_avx2.cpp`, `iq_avx512.cpp`, `kq_avx2.cpp`,
++  `kq_avx1.cpp`, the AVX-VNNI compiler probe, and the parity programs that test those kernels (`router_dot_parity`,
++  `iq_avx2_parity`, `q8k_quant_parity`, `expert_multi_test`, `expert_parity`, `pool_test`, `pool_stress`).
++- The CPU probes in `expert_layout.cpp` (`cpu_avx2_ok`, `cpu_avx512_ok`, ...) say no to every x86 feature. The engine then
++  takes the paths a CPU without AVX2 takes on the older-CPU build (`STRATA_ISA_FLOOR`): ggml-cpu's dot products for the CPU's
++  expert rows, the plain C++ router dot. `src/kernels/cpu/x86_kernels_absent.cpp` stands in for the kernels at link time; a
++  kernel that should never be called aborts with its name.
++- The canonical Q2_0 pack (`experts.bin`) needs Strata's AVX-512 kernels, so the engine refuses it with a message. Native (GGUF)
++  packs run: the pinned ggml has NEON dot products for every format they use (IQ2_XS, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL,
++  IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0, Q2_0).
++- `_mm_pause` and `_mm_sfence` come from `include/strata/platform/spin.hpp`: `<immintrin.h>` on x86, `yield` and `dsb st` on
++  aarch64. `dsb st` is the conservative choice, because these fences order the host's stores before a doorbell the GPU reads.
++- ggml-cpu gets `-march` from this CPU's `/proc/cpuinfo` features (`cmake/arm_arch.cmake`, used by the vision encoder too). On
++  the Spark that is `-march=armv8.2-a+dotprod+fp16+i8mm+bf16+sve+sve2`. `-DSTRATA_ARM_ARCH=<march>` overrides it, and
++  `-DSTRATA_ARM_ARCH=native` keeps ggml's own detection.
++- Host C/C++ is compiled with `-ffp-contract=off`, as x86 builds behave (see "Two findings").
++- `CMAKE_CUDA_ARCHITECTURES` defaults to `121`.
++- `STRATA_PORTABLE` and `STRATA_ISA_FLOOR` are refused on aarch64: both are x86 builds.
++
++**Setup (`setup.py`).** `ARM64` is true when `platform.machine()` is aarch64/arm64. Then:
++
++- The CPU is named from `lscpu` ("Cortex-X925 + Cortex-A725"). It is never sent to the x86 floor checks, which would have
++  stopped setup with "this CPU has neither AVX2 nor SSE4.2".
++- The engine is always compiled on the Spark. The ready-made engines are x86-64, so none is downloaded.
++- A GPU whose `memory.total` is `[N/A]` (GB10) counts as unified memory: usable GPU memory = RAM less the 6 GB the OS keeps
++  (`UMA_OS_LEFT_GB`, the same figure the engine's `device_free_bytes()` leaves), and nothing beside the RAM. So the RAM is
++  never counted twice. Upstream setup skipped such a GPU and stopped with "no NVIDIA GPU found".
++- The PCIe probe is skipped for it.
++- Q2_0 is not offered. Its pack needs AVX-512.
++- Unsloth UD-IQ4_XS is recommended (from 80 GB of memory, the Strix Halo rule).
++- The CUDA keyring URL is NVIDIA's `sbsa` repository, never `x86_64`. A DGX OS without nvcc is told to restore its own toolkit.
++
++**`Dockerfile.spark`.** `./Dockerfile` with `CUDA_ARCHITECTURES=121`, the same entrypoint, environment variables and `/data`
++volume. **Not built yet.**
++
++**Line endings.** `.gitattributes` pins `Dockerfile*`, `*.py`, `*.cmake` and `CMakeLists.txt` to LF, so a Windows clone with
++`core.autocrlf` does not break the Dockerfile heredoc.
++
++## Build it
++
++### Bare metal
++
++```sh
++git clone -b spark-port https://github.com/drkstar360/Strata-dgx.git ~/Strata
++cd ~/Strata
++./setup.sh                      # or unattended: ./setup.sh --yes --family unsloth --model UD-IQ4_XS --no-start
++```
++
++Setup finds nvcc in `/usr/local/cuda` by itself. Step 1 printed this on the Spark:
++
++```
++  [ok] GPU: NVIDIA GB10, unified memory: shares the RAM, 116 GB usable by the GPU, compute capability 12.1, driver 580.178.04 (docs/DGX_SPARK.md)
++  [ok] RAM: 122 GB
++  [ok] CPU: Cortex-X925 + Cortex-A725 (ARM64: the engine is compiled here, its CPU experts on ggml-cpu)
++```
++
++The UD-IQ4_XS menu line says "keeps ~55 GB of its 60 GB of experts in RAM". 59.5 GB is 55.4 GiB, so that is all of them. The
++engine setup built recorded `"archs": [121]` in `engine/BUILD.json`.
++
++By hand, without setup:
++
++```sh
++export PATH=/usr/local/cuda/bin:$PATH
++cmake -S . -B build-arm -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON
++cmake --build build-arm -j 20
++cd build-arm && ctest --output-on-failure
++```
++
++The first configure takes about 4 minutes (218 s on the Spark), most of it cloning the pinned llama.cpp.
++
++### Docker
++
++Build and run it **on the Spark**. The base image is multi-arch, so docker pulls arm64 there; Docker Desktop on an x86 PC would
++make an amd64 image.
++
++```sh
++docker build -f Dockerfile.spark -t strata-spark .
++docker image inspect strata-spark --format '{{.Architecture}}'      # arm64
++docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 --ulimit memlock=-1 \
++  -v strata-data:/data -e FAMILY=unsloth -e MODEL=UD-IQ4_XS strata-spark
++```
++
++Add `-e API_KEY=<secret>` before publishing the port beyond `127.0.0.1`.
++
++Or with Docker Compose (`docker-compose.spark.yml`), which keeps the data in `strata-data/` in the project root instead of a
++named volume. `.dockerignore` and `.gitignore` leave that folder out, so the model files never go into the image or into git:
++
++```sh
++mkdir -p strata-data                                      # created by you, so it is not owned by root
++docker compose -f docker-compose.spark.yml up -d --build
++docker compose -f docker-compose.spark.yml logs -f
++curl -fs http://127.0.0.1:8080/health
++```
++
++Its settings come from the environment or a `.env` file: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT`
++(`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `REINSTALL`, `STRATA_PORT` (`8080`), `BUILD_VISION` (`1`). For GGUF
++files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container runs as root, so
++the files it writes in `strata-data/` are owned by root.
++
++## Applying the port to a newer upstream
++
++`patches/dgx-spark.patch` is the whole port as one patch against upstream `main` (Niko1221/Strata). It holds every change
++listed above, this document included. Applied to upstream commit `e8ca9af` it gives exactly this fork's tree.
++
++On a fresh upstream checkout:
++
++```sh
++git clone https://github.com/Niko1221/Strata.git && cd Strata
++git apply --3way /path/to/dgx-spark.patch
++git status                       # every file it touched; a conflict is marked in the file like a merge conflict
++```
++
++`--3way` falls back to a three-way merge where upstream has changed the same lines since. That works because the patch
++names the upstream file versions it was made from, which every upstream clone has.
++
++In this fork, merging upstream keeps the history and is usually simpler: `git fetch upstream && git merge upstream/main`.
++Afterwards, regenerate the patch so it matches the new upstream (it leaves `patches/` itself out):
++
++```sh
++git diff --binary upstream/main main -- . ':(exclude)patches' > patches/dgx-spark.patch
++```
++
++## Results so far
++
++**Build.** The engine compiles and links on the Spark: an `ELF 64-bit ... ARM aarch64` executable, with GPU code for
++`compute_121` only. The compile log has 0 hits for `-mavx`, `-mf16c` and `-mfma`.
++
++**Tests** (`ctest -j 4` on the Spark):
++
++| Run | Passed | Failed |
++| --- | --- | --- |
++| first build | 83 / 87 | `qsa_select_bench`, `quantize_act_parity`, `expert_cache_segmented_test`, `ple_parity` |
++| with `-ffp-contract=off` | 84 / 87 | `ple_parity`, `expert_cache_segmented_test`, `ple_reader_selftest` |
++
++What is left in the second run:
++
++- **`ple_parity`** needs the Q2_0 model file (`../../Q2_0/...gguf`), which was not on the Spark. It fails the same way on any PC
++  without it.
++- **`expert_cache_segmented_test`** failed in both parallel runs and passed run alone (0.78 s).
++- **`ple_reader_selftest`** failed after 156.57 s while setup was compiling and downloading next to it; it passed alone (106.99 s).
++
++**x86 unchanged.** On Windows (MSVC 14.42, CMake 4.4.3, Ninja), upstream `main` and this branch were configured the same way and
++their `compile_commands.json` compared. Both have the same 66 compile commands, with identical flags: the same `/arch:AVX512`,
++`/arch:AVX2` and `/arch:AVX` on the same files, and identical configure messages. This covers the CPU side only, configured with
++`STRATA_ENABLE_CUDA=OFF`, because that PC has no Windows SDK and CUDA's compiler check needs to link. A full x86 build has not
++been run.
++
++## Two findings
++
++- **GCC 13 does not know the GB10 cores.** `-mcpu=native` falls back to generic ARMv8: it defines 5 `__ARM_FEATURE_*` macros and
++  no dotprod, i8mm or SVE. ggml's ARM checks (`HAVE_DOTPROD`, `HAVE_SVE`, `HAVE_MATMUL_INT8`) all failed, so ggml-cpu would have
++  built without its fast paths. `-march=armv8.2-a+dotprod+fp16+i8mm+bf16+sve+sve2` defines 21, including DOTPROD,
++  MATMUL_INT8, SVE, SVE2 and BF16. Hence `cmake/arm_arch.cmake`.
++- **GCC on aarch64 fuses `a*b+c` into one FMA by default** (`-ffp-contract=fast`). An x86 build without `-mfma` never does.
++  ggml's `nearest_int(iscale * x)` is `iscale*x + 12582912.0f`. Fused, the product is not rounded first, so an exact .5 tie
++  rounds the other way. `quantize_act_parity`'s Q8_K reference got -37 where the GPU kernel (and x86) gives -38 (block 343,
++  element 144, `iscale*x` = -37.5). `qsa_select_bench`'s fast-scorer error was 0.000273 against a limit of about 0.000269 (1e-6
++  of the score scale 269). Both pass with `-ffp-contract=off`. NEON code with explicit FMA intrinsics, and device code (nvcc's
++  `--fmad`), are not affected.
++
++The pinned CMake default of `CMAKE_CUDA_ARCHITECTURES` 120 never applies upstream either. `enable_language(CUDA)` runs first and
++sets nvcc's default, 75 for CUDA 13. The first Spark build compiled `compute_75` for that reason. Setup always passes the
++architecture, so x86 users are not affected. On aarch64 the 121 default is set before `enable_language(CUDA)`.
++
++## Not done yet
++
++- **A model run.** No model was downloaded. The API checks, temperature-0 output checks (code, a math answer, a 32K-token recall
++  test) and decode / prompt tok/s at a short prompt and at 32K are still to do.
++- **`Dockerfile.spark`** and **`docker-compose.spark.yml`** have not been built or run.
++- **Pinning on unified memory.** The engine page-locks tens of GB of host RAM for the GPU (`cudaHostRegister`, `mlock`). On the
++  Spark host and GPU memory are one pool, so this may be pointless. Startup time, peak RSS and tok/s with the pinning as it is,
++  and with less (`STRATA_RESIDENT_PIN=0`, `STRATA_ARENA_LOCK=0`, `STRATA_ARENA_PIN_GIB`), are to be measured.
++- **The expert cache on unified memory.** `device_free_bytes()` already counts `MemAvailable` less `STRATA_UMA_HEADROOM_GIB`
++  (default 6) for any integrated GPU on Linux, on the CUDA path too (`src/core/expert_cache.cpp`, read, not measured). So
++  `--expert-cache auto` may copy experts that are already in the same RAM. Whether that helps or only uses memory is to be
++  measured.
++- **The mixed cores.** The 20 cores are 10 Cortex-X925 and 10 Cortex-A725, and the expert pool pins one worker per core. CPU expert
++  work may wait on the slower cores. Not measured.
++- **Q2_0 as a native GGUF.** ggml has a NEON Q2_0 dot product, so the native Q2_0 GGUF (not the canonical pack) may run. Setup
++  hides Q2_0 on ARM until it is tested.
+diff --git a/include/strata/platform/spin.hpp b/include/strata/platform/spin.hpp
+new file mode 100644
+index 0000000..a6af3d4
+--- /dev/null
++++ b/include/strata/platform/spin.hpp
+@@ -0,0 +1,13 @@
++// include/strata/platform/spin.hpp - `_mm_pause` and `_mm_sfence` on every CPU Strata builds for.
++//
++// x86: exactly <immintrin.h>.  aarch64 (the DGX Spark, docs/DGX_SPARK.md): `yield` for the spin-wait hint, and
++// `dsb st` for the store fence: the fences order the host's stores ahead of a doorbell the GPU reads from mapped host
++// memory, so the barrier waits for them to complete system-wide (a `dmb` would only order them for other CPUs).
++#pragma once
++
++#if defined(STRATA_ARM64) && defined(__aarch64__)
++static inline void _mm_pause() { __asm__ __volatile__("yield" ::: "memory"); }
++static inline void _mm_sfence() { __asm__ __volatile__("dsb st" ::: "memory"); }
++#else
++#include <immintrin.h>
++#endif
+diff --git a/setup.py b/setup.py
+index 14d982c..9869c7b 100644
+--- a/setup.py
++++ b/setup.py
+@@ -59,6 +59,9 @@ from pathlib import Path
+ 
+ ROOT = Path(__file__).resolve().parent
+ WIN = os.name == "nt"
++# an ARM CPU (the DGX Spark, docs/DGX_SPARK.md): no ready-made engine, so it is always compiled here, with ggml-cpu for
++# the CPU's experts (Strata's own CPU kernels are x86); its GPU shares the RAM (nvidia_apply_uma)
++ARM64 = platform.machine().lower() in ("aarch64", "arm64")
+ # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
+ # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
+ # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
+@@ -608,6 +611,10 @@ def cpu_info():
+         n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
+         name = n or name
+         avx512 = bool(pf(41)) and _cpuid_avx512_full()
++    elif ARM64:
++        # /proc/cpuinfo on ARM has no "flags" and no model name, only part numbers; lscpu names the cores
++        names = re.findall(r"^\s*Model name:\s*(.+?)\s*$", out(["lscpu"]), re.M)
++        name = " + ".join(dict.fromkeys(names)) or "ARM64 CPU"
+     else:
+         try:
+             txt = open("/proc/cpuinfo").read()
+@@ -646,6 +653,8 @@ def cpu_floor(avx2: bool) -> str:
+     """The experimental older-CPU build this PC needs (#394 #595 #623): "" with AVX2 (the normal engine), "avx" (Sandy /
+     Ivy Bridge, AMD Bulldozer), "none" (SSE4.2 + POPCNT: Nehalem, Westmere), or "unsupported".  STRATA_ISA_FLOOR=avx|
+     none asks for that build on any PC (testing it on a newer one)."""
++    if ARM64:
++        return ""                                      # its own build (the engine's CMake), never an x86 floor
+     forced = os.environ.get("STRATA_ISA_FLOOR", "").strip().lower()
+     if forced in ("avx", "none"):
+         return forced
+@@ -733,6 +742,11 @@ def gpus():
+     for line in s.strip().splitlines():
+         try:
+             idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
++            if ARM64 and not mem.replace(".", "", 1).isdigit():
++                # GB10 (DGX Spark): no memory of its own, nvidia-smi says [N/A]; it uses the RAM (nvidia_apply_uma)
++                found.append(nvidia_apply_uma({"index": int(idx), "name": name, "vram_gb": 0.0,
++                                               "arch": cc.replace(".", ""), "driver": drv}))
++                continue
+             found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
+                           "driver": drv})
+         except ValueError:
+@@ -1767,6 +1781,17 @@ def amd_apply_uma(g: dict, gtt_gb: float = 0.0, ram: float | None = None) -> dic
+     return g
+ 
+ 
++def nvidia_apply_uma(g: dict, ram: float | None = None) -> dict:
++    """An NVIDIA GPU with no memory of its own (GB10, DGX Spark: nvidia-smi says memory.total [N/A]): the CPU and the
++    GPU share the RAM, as on Strix Halo, but with no carve-out.  The engine's device_free_bytes() counts MemAvailable
++    less the OS's share for it, so: dedicated_gb 0 (nothing beside the RAM for the low-RAM mode), vram_gb = the RAM less
++    what the OS keeps (UMA_OS_LEFT_GB), which sizes the context and the parallel slots.  Never counted twice."""
++    ram = ram_gb() if ram is None else ram
++    shared = max(0.0, ram - UMA_OS_LEFT_GB)
++    g.update({"uma": True, "dedicated_gb": 0.0, "shared_gb": shared, "vram_gb": shared})
++    return g
++
++
+ def low_ram_vram(g) -> float:
+     """The GPU memory the low-RAM mode may count as room beside the RAM: a discrete card's VRAM; an APU's BIOS
+     carve-out only (its shared memory is the RAM itself)."""
+@@ -2696,6 +2721,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
+     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
+     updating: called to replace an installed engine, which starts instead when this fails (no compile).
+     toolkit 12: the experimental CUDA 12 engine (CUDA12_ASSET) in engine-cuda12/."""
++    if ARM64:
++        return None                                    # the releases are x86-64 only: compiled here (build_engine)
+     eng = engine_dir(toolkit)
+     asset = CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
+     info = eng / "BUILD.json"
+@@ -2979,7 +3006,11 @@ def install_build_tools(gpu, yes):
+                 fail("the CUDA Toolkit can be installed automatically on Ubuntu 22.04 / 24.04 only",
+                      "install it from https://developer.nvidia.com/cuda-downloads and run it again")
+             deb = Path("/tmp/cuda-keyring.deb")
+-            download(f"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu{ver}/x86_64/cuda-keyring_1.1-1_all.deb",
++            if ARM64 and nvcc is None:                 # DGX OS ships CUDA in /usr/local/cuda; never NVIDIA's x86 repo
++                fail("the CUDA Toolkit (nvcc) was not found in /usr/local/cuda*",
++                     "on a DGX Spark it comes with DGX OS: reinstall it with NVIDIA's DGX OS update, then run this again")
++            download(f"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu{ver}/"
++                     f"{'sbsa' if ARM64 else 'x86_64'}/cuda-keyring_1.1-1_all.deb",
+                      deb, "CUDA repository key")
+             run(["sudo", "dpkg", "-i", str(deb)])
+             run(["sudo", "apt-get", "update"])
+@@ -4736,7 +4767,9 @@ def main() -> int:
+         gpu["archs"] = sorted({x["arch"] for x in chosen})  # the engine needs code for every one of them
+         if multi:
+             ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
+-        ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {cc(gpu)}, driver {gpu['driver']}")
++        ok(f"GPU: {gpu['name']}, " + (f"unified memory: shares the RAM, {gpu['vram_gb']:.0f} GB usable by the GPU"
++                                       if gpu.get("uma") else f"{gpu['vram_gb']:.1f} GB VRAM")
++           + f", compute capability {cc(gpu)}, driver {gpu['driver']}" + (" (docs/DGX_SPARK.md)" if ARM64 else ""))
+         cuda_tk, why = cuda_choice(gpu["archs"], a.cuda)   # one engine per model: its oldest card decides
+         if why:
+             (warn if cuda_tk == 13 or str(a.cuda) == "12" else ok)(f"CUDA {cuda_tk}: {why}")
+@@ -4773,8 +4806,10 @@ def main() -> int:
+         warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
+              "the model may not start or may use less VRAM. Set it to \"System managed\": System > About > "
+              "Advanced system settings > Performance > Advanced > Virtual memory")
+-    ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
+-    link = None if hip else pcie_link(int(gpu.get("index", 0)))
++    ok(f"CPU: {cpu} (" + ("ARM64: the engine is compiled here, its CPU experts on ggml-cpu" if ARM64 else
++                         'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2') + ")")
++    # a GPU sharing the RAM has no PCIe hop to its memory (GB10 reports a gen-1 link that means nothing)
++    link = None if hip or (ARM64 and gpu.get("uma")) else pcie_link(int(gpu.get("index", 0)))
+     if link is not None:
+         line, problem = pcie_lines(link)
+         ok(line)
+@@ -4783,7 +4818,9 @@ def main() -> int:
+     floor = cpu_floor(avx2)
+     if floor == "unsupported":
+         fail("this CPU has neither AVX2 nor SSE4.2; Strata needs at least SSE4.2 (Intel Nehalem, 2008, or newer)")
+-    if not avx2:
++    if ARM64:
++        a.build = True                                 # no ready-made ARM engine
++    elif not avx2:
+         # #394 #595 #623: the ready-made engine is AVX2; an older CPU gets one compiled here, whose CPU experts run on
+         # ggml-cpu's kernels for this CPU.  Experimental: measured only on newer CPUs with the older path forced, and by
+         # users on a few Xeons.  A warning, not a stop.
+@@ -4831,7 +4868,8 @@ def main() -> int:
+         for i, f in enumerate(fams, 1):
+             d = FAMILIES[f]
+             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
+-                + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
++                + (f"   (recommended for {'DGX Spark' if ARM64 else 'Strix Halo'}: {STRIX_HALO_MODEL})"
++                   if f == rec_fam and rec_fam != fams[0] else ""))
+         family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)],
+                               str(fams.index(rec_fam) + 1), a.yes)) - 1]
+     fam = FAMILIES[family]
+@@ -4840,6 +4878,8 @@ def main() -> int:
+         say(f"  Its license: {fam['license']}")
+     say()
+     names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
++    if ARM64:                                          # its pack needs Strata's AVX-512 kernels (docs/DGX_SPARK.md)
++        names = [m for m in names if m != "Q2_0"]
+     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
+     if a.model and a.model not in names:
+         # #444: say which family has that size, and (with --gguf-dir) which files Strata can run at all
+diff --git a/src/core/graph.cpp b/src/core/graph.cpp
+index 2e9c7e7..7f62510 100644
+--- a/src/core/graph.cpp
++++ b/src/core/graph.cpp
+@@ -1,7 +1,7 @@
+ // src/core/graph.cpp - P2.S5: the GraphRegistry implementation.
+ #include "strata/core/graph.hpp"
+ 
+-#include <immintrin.h>
++#include "strata/platform/spin.hpp"   // <immintrin.h> on x86
+ 
+ #include <chrono>
+ #include <cstdio>
+diff --git a/src/core/session.cpp b/src/core/session.cpp
+index d87452d..530c806 100644
+--- a/src/core/session.cpp
++++ b/src/core/session.cpp
+@@ -25,6 +25,7 @@
+ #include <immintrin.h>
+ #define STRATA_SPIN_PAUSE() _mm_pause()
+ #else
++#include "strata/platform/spin.hpp"   // _mm_sfence (below) on aarch64
+ #define STRATA_SPIN_PAUSE() ((void) 0)
+ #endif
+ 
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 6b80569..643d8f4 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -54,7 +54,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <exception>
+-#include <immintrin.h>
++#include "strata/platform/spin.hpp"   // <immintrin.h> on x86
+ 
+ namespace strata::core {
+ namespace {
+diff --git a/src/kernels/cpu/expert_layout.cpp b/src/kernels/cpu/expert_layout.cpp
+index cc218f2..b63f8bc 100644
+--- a/src/kernels/cpu/expert_layout.cpp
++++ b/src/kernels/cpu/expert_layout.cpp
+@@ -8,7 +8,7 @@
+ #if defined(_MSC_VER)
+ #include <intrin.h>
+ #include <immintrin.h>
+-#else
++#elif !defined(STRATA_ARM64)
+ #include <cpuid.h>
+ #endif
+ #include <fstream>
+@@ -37,6 +37,15 @@ int cpu_isa_cap() {
+     return cap;
+ }
+ 
++#if defined(STRATA_ARM64)
++// The aarch64 build (docs/DGX_SPARK.md): no x86 feature is here, so every check says no and the engine takes the
++// paths a CPU without AVX2 takes - ggml-cpu (NEON/SVE) for the experts, the plain C++ router dot.
++bool cpu_avx512_ok() { return false; }
++bool cpu_avx512bw_ok() { return false; }
++bool cpu_avx2_ok() { return false; }
++bool cpu_avx1_ok() { return false; }
++bool cpu_sse42_ok() { return false; }
++#else
+ bool cpu_avx512_ok() {
+     static const bool ok = [] {
+         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
+@@ -175,6 +184,7 @@ bool cpu_sse42_ok() {
+     }();
+     return ok;
+ }
++#endif
+ 
+ const char* isa_floor_build() {
+ #if defined(STRATA_ISA_FLOOR_AVX)
+@@ -186,6 +196,7 @@ const char* isa_floor_build() {
+ #endif
+ }
+ 
++#if !defined(STRATA_ARM64)
+ namespace {
+ void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
+ #if defined(_MSC_VER)
+@@ -197,6 +208,7 @@ void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
+ #endif
+ }
+ }  // namespace
++#endif
+ 
+ int iq256_gather_setting() {
+     static const int s = [] {
+@@ -207,6 +219,12 @@ int iq256_gather_setting() {
+     return s;
+ }
+ 
++#if defined(STRATA_ARM64)
++bool cpu_gather_fast() { return false; }
++bool cpu_gather_fast_here() { return false; }
++bool cpu_avxvnni_ok() { return false; }
++std::string cpu_name() { return "aarch64"; }   // /proc/cpuinfo names no model on ARM, only part numbers
++#else
+ bool cpu_gather_fast() {
+     static const bool ok = [] {
+         if (cpu_isa_cap() < 3) return false;   // STRATA_FORCE_ISA: as on a CPU that stops at AVX2
+@@ -285,6 +303,7 @@ std::string cpu_name() {
+     const size_t b0 = name.find_first_not_of(' '), b1 = name.find_last_not_of(' ');
+     return b0 == std::string::npos ? std::string("unknown") : name.substr(b0, b1 - b0 + 1);
+ }
++#endif
+ 
+ void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
+                  int r0, int r1) {
+diff --git a/src/kernels/cpu/pool.cpp b/src/kernels/cpu/pool.cpp
+index 16e3fb2..5c8cb27 100644
+--- a/src/kernels/cpu/pool.cpp
++++ b/src/kernels/cpu/pool.cpp
+@@ -7,7 +7,7 @@
+ #include <atomic>
+ #include <cmath>
+ #include <chrono>
+-#include <immintrin.h>
++#include "strata/platform/spin.hpp"   // <immintrin.h> on x86
+ 
+ #include <cstdio>
+ #include <cstdlib>
+diff --git a/src/kernels/cpu/x86_kernels_absent.cpp b/src/kernels/cpu/x86_kernels_absent.cpp
+new file mode 100644
+index 0000000..974d2f3
+--- /dev/null
++++ b/src/kernels/cpu/x86_kernels_absent.cpp
+@@ -0,0 +1,149 @@
++// src/kernels/cpu/x86_kernels_absent.cpp - the aarch64 build's stand-ins for Strata's x86 expert kernels
++// (docs/DGX_SPARK.md).  expert.cpp, q2_avx2.cpp, iq_avx2.cpp, iq_avx512.cpp, kq_avx2.cpp and kq_avx1.cpp are not
++// compiled there: the CPU probes (expert_layout.cpp) say no to every x86 feature, so the engine takes ggml-cpu's
++// dot products for native packs, the plain C++ router dot, and refuses the canonical AVX-512 Q2_0 pack - the same
++// paths an older-CPU (STRATA_ISA_FLOOR) engine takes on a CPU without AVX2.  What is still called on those paths is
++// real code here (the probes' answers, the scalar activation quantizer, the oracle flag); a kernel that only runs
++// behind a "yes" from a probe aborts with its name, so a missed check shows up as that instead of a wrong answer.
++#include "strata/kernels/cpu/expert.hpp"
++#include "strata/kernels/cpu/iq_avx2.hpp"
++#include "strata/kernels/cpu/iq_avx512.hpp"
++#include "strata/kernels/cpu/kq_avx1.hpp"
++#include "strata/kernels/cpu/kq_avx2.hpp"
++
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++
++namespace strata::kernels::cpu {
++namespace {
++
++std::atomic<bool> oracle_q8_0{false};
++
++[[noreturn]] void absent(const char* name) {
++    std::fprintf(stderr, "strata: %s is an x86 kernel and this is the aarch64 build; it should not have been "
++                         "called (a CPU check is missing)\n", name);
++    std::abort();
++}
++
++}  // namespace
++
++const char* CpuFeatures::reason() const { return "not an x86 CPU (aarch64 build)"; }
++
++CpuFeatures cpu_features() { return {}; }
++
++void cpu_require_expert_support() {
++    std::fprintf(stderr,
++                 "strata: the canonical Q2_0 expert pack (experts.bin) needs Strata's AVX-512 kernels, which an\n"
++                 "        aarch64 CPU does not have. Use a native (GGUF) pack instead: IQ2_XS, IQ3_XXS, IQ3_S or the\n"
++                 "        Unsloth UD-IQ4_XS (docs/DGX_SPARK.md).\n");
++    std::exit(1);
++}
++
++void expert_set_oracle_q8_0(bool enabled) { oracle_q8_0.store(enabled, std::memory_order_relaxed); }
++
++bool expert_oracle_q8_0_enabled() { return oracle_q8_0.load(std::memory_order_relaxed); }
++
++// expert.cpp's scalar loop, unchanged: round half away from zero, clamp to +-127.  The oracle Q8_0 quantizer is only
++// for the S2 kernels of the canonical pack, which this build refuses.
++void act_quant_q8_1(const float* x, int n, ActQ& a) {
++    a.nchunks = n / QKA;
++    for (int k = 0; k < a.nchunks; ++k) {
++        const float* xb = x + k * QKA;
++        float amax = 0.f;
++        for (int j = 0; j < QKA; ++j) amax = std::fmax(amax, std::fabs(xb[j]));
++        const float s = amax > 0.f ? amax / 127.f : 0.f;
++        const float inv = s > 0.f ? 1.f / s : 0.f;
++        int32_t sum = 0;
++        int8_t* q = a.q + k * QKA;
++        for (int j = 0; j < QKA; ++j) {
++            const float t = xb[j] * inv;
++            const float r = t + (t >= 0.f ? 0.5f : -0.5f);
++            int v = (int) r;
++            v = v < -127 ? -127 : (v > 127 ? 127 : v);
++            q[j] = (int8_t) v;
++            sum += v;
++        }
++        a.scale[k] = s;
++        a.sum[k] = sum;
++        a.hx[k] = s * (float) sum;
++    }
++}
++
++void act_quant_q8_1_avx2(const float* x, int n, ActQ& a) { act_quant_q8_1(x, n, a); }
++
++bool q2_bitplane_enabled() { return false; }
++bool iq256_supported(int) noexcept { return false; }
++bool iq512_supported(int) noexcept { return false; }
++bool kq256_supported(int) noexcept { return false; }
++int iq256_variant() noexcept { return 0; }
++int iq256_variants() noexcept { return 0; }
++
++void s2_expert_vnni(const uint8_t*, const float*, float*, ExpertScratch&) { absent("s2_expert_vnni"); }
++void s2_expert_vnni_q(const uint8_t*, const ActQ&, float*, ExpertScratch&) { absent("s2_expert_vnni_q"); }
++void s2_expert_gu_rows(const uint8_t*, const ActQ&, float*, int, int) { absent("s2_expert_gu_rows"); }
++void s2_expert_down_rows(const uint8_t*, const ActQ&, float*, int, int) { absent("s2_expert_down_rows"); }
++void s2_expert_gu_rows_multi(const uint8_t*, const ActQ* const*, int, float* const*, int, int) {
++    absent("s2_expert_gu_rows_multi");
++}
++void s2_expert_down_rows_multi(const uint8_t*, const ActQ* const*, int, float* const*, int, int) {
++    absent("s2_expert_down_rows_multi");
++}
++void s2_expert_vnni_multi(const uint8_t*, const ActQ* const*, int, float* const*, ExpertScratchMulti&) {
++    absent("s2_expert_vnni_multi");
++}
++void s2_expert_scalar(const uint8_t*, const float*, float*, bool) { absent("s2_expert_scalar"); }
++void q2_0_gguf_rows_multi(const uint8_t*, size_t, int, const ActQ* const*, int, float* const*, int, int) {
++    absent("q2_0_gguf_rows_multi");
++}
++void q2_0_gguf_rows_multi_avx2(const uint8_t*, size_t, int, const ActQ* const*, int, float* const*, int, int) {
++    absent("q2_0_gguf_rows_multi_avx2");
++}
++void q2_0_gguf_rows_multi_avx2_legacy(const uint8_t*, size_t, int, const ActQ* const*, int, float* const*, int, int) {
++    absent("q2_0_gguf_rows_multi_avx2_legacy");
++}
++void q2_0_gguf_rows_multi_avx2_v(bool, const uint8_t*, size_t, int, const ActQ* const*, int, float* const*, int,
++                                 int) {
++    absent("q2_0_gguf_rows_multi_avx2_v");
++}
++
++void iq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("iq256_gu_rows");
++}
++void iq256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("iq256_rows");
++}
++void iq256_gu_rows_v(int, int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int,
++                     int) {
++    absent("iq256_gu_rows_v");
++}
++void iq256_rows_v(int, int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("iq256_rows_v");
++}
++void q8k_quant_avx2(const float*, void*, int64_t) { absent("q8k_quant_avx2"); }
++void iq4nl256_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("iq4nl256_down_rows");
++}
++void iq4nl256_down_rows_v(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("iq4nl256_down_rows_v");
++}
++void iq512_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("iq512_gu_rows");
++}
++void iq512_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("iq512_rows");
++}
++void kq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("kq256_gu_rows");
++}
++void kq256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
++    absent("kq256_rows");
++}
++void bf16_rows_dot(const uint16_t*, int, int, const float*, float*) { absent("bf16_rows_dot"); }
++void bf16_rows_dot_multi(const uint16_t*, int, int, const float*, int, float*) { absent("bf16_rows_dot_multi"); }
++void bf16_rows_dot_multi_avx1(const uint16_t*, int, int, const float*, int, float*) {
++    absent("bf16_rows_dot_multi_avx1");
++}
++
++}  // namespace strata::kernels::cpu
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index a78d088..5efb2df 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -2316,6 +2316,11 @@ int main(int argc, char** argv) {
+     // next.  Refused here, by name, rather than an illegal instruction in the first expert.
+     // The experimental older-CPU build (STRATA_ISA_FLOOR=avx|none, compiled on that PC; #394 #595 #623) has ggml-cpu
+     // for that floor, so a native pack's experts run there on ggml-cpu (every AVX2 kernel is behind cpu_avx2_ok).
++#if defined(STRATA_ARM64)
++    // The aarch64 build (docs/DGX_SPARK.md) has no x86 kernels at all: ggml-cpu, compiled for this CPU, computes the
++    // CPU's expert rows, and the canonical AVX-512 pack is refused below (cpu_require_expert_support).
++    std::fprintf(stderr, "strata generate: aarch64 build: the CPU's experts run on ggml-cpu (NEON/SVE)\n");
++#else
+     const char* isa_floor = strata::kernels::cpu::isa_floor_build();
+     if (!strata::kernels::cpu::cpu_avx2_ok() && isa_floor[0] == '\0') {
+         std::fprintf(stderr, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
+@@ -2341,6 +2346,7 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "strata generate: this is the older-CPU build (ggml-cpu for %s); this CPU has AVX2, "
+                                  "and the normal build is faster on it\n", isa_floor);
+     }
++#endif
+ 
+     std::string err;
+     if (!o.native_head_gguf.empty() && !o.stream_token) {
+@@ -2410,11 +2416,13 @@ int main(int argc, char** argv) {
+     }
+     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
+     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
++#if !defined(STRATA_ARM64)    // said above on aarch64
+     else if (!strata::kernels::cpu::cpu_avx512_ok())
+         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
+                              "(multi-token for the i-quant gate/up rows)\n",
+                      !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
+                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
++#endif
+     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
+     int64_t K = 10;
+     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
+diff --git a/tools/test_setup_arm64.py b/tools/test_setup_arm64.py
+new file mode 100644
+index 0000000..9442b5e
+--- /dev/null
++++ b/tools/test_setup_arm64.py
+@@ -0,0 +1,91 @@
++"""Tests for setup.py on an ARM CPU (the DGX Spark, docs/DGX_SPARK.md): the CPU is named and never sent to the x86
++floor checks, the GB10's "[N/A]" memory makes it a unified-memory GPU sized from the RAM, no ready-made (x86) engine is
++used, and on x86 nothing changes.  No compiler, no GPU.
++
++    python -m unittest tools.test_setup_arm64
++"""
++from __future__ import annotations
++
++import io
++import os
++import sys
++import unittest
++from pathlib import Path
++from unittest import mock
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++import setup  # noqa: E402
++
++# what a DGX Spark reports (measured, docs/DGX_SPARK.md)
++SPARK_SMI = "0, NVIDIA GB10, [N/A], 12.1, 580.178.04\n"
++SPARK_CPUINFO = ("processor\t: 0\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics "
++                 "fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit "
++                 "uscat ilrcpc flagm sb paca pacg dcpodp sve2 i8mm bf16\nCPU implementer\t: 0x41\nCPU part\t: 0xd85\n")
++SPARK_LSCPU = ("Architecture:             aarch64\n  Model name:             Cortex-X925\n"
++               "  Model name:             Cortex-A725\n")
++SPARK_RAM = 121.7
++
++
++def spark():
++    """setup as it runs on the Spark: ARM64, Linux, its nvidia-smi / lscpu / cpuinfo / RAM."""
++    return [mock.patch.object(setup, "ARM64", True), mock.patch.object(setup, "WIN", False),
++            mock.patch.object(setup, "ram_gb", return_value=SPARK_RAM),
++            mock.patch.object(setup, "out", lambda cmd: SPARK_LSCPU if cmd[0] == "lscpu" else SPARK_SMI),
++            mock.patch("builtins.open", lambda *a, **k: io.StringIO(SPARK_CPUINFO))]
++
++
++class Arm64Test(unittest.TestCase):
++    def setUp(self):
++        self.patches = spark()
++        for p in self.patches:
++            p.start()
++
++    def tearDown(self):
++        for p in reversed(self.patches):
++            p.stop()
++
++    def test_cpu_is_named_without_x86_flags(self):
++        name, avx2, avx512 = setup.cpu_info()
++        self.assertEqual(name, "Cortex-X925 + Cortex-A725")
++        self.assertFalse(avx2)
++        self.assertFalse(avx512)
++
++    def test_no_x86_floor(self):
++        self.assertEqual(setup.cpu_floor(False), "")
++        with mock.patch.dict(os.environ, {"STRATA_ISA_FLOOR": "none"}):
++            self.assertEqual(setup.cpu_floor(False), "")      # an x86 build CMake refuses on ARM
++
++    def test_gb10_is_unified_memory(self):
++        found = setup.gpus()
++        self.assertEqual(len(found), 1)
++        g = found[0]
++        self.assertEqual((g["name"], g["arch"], setup.cc(g)), ("NVIDIA GB10", "121", "12.1"))
++        self.assertTrue(g["uma"])
++        self.assertAlmostEqual(g["vram_gb"], SPARK_RAM - setup.UMA_OS_LEFT_GB)
++        self.assertEqual(setup.low_ram_vram(g), 0.0)          # the RAM is not counted twice
++        self.assertTrue(setup.strix_halo_recommends(g, SPARK_RAM))   # UD-IQ4_XS fits in the shared memory
++
++    def test_no_ready_made_engine(self):
++        self.assertIsNone(setup.get_prebuilt("https://example.invalid/", {"arch": "121"}, False))
++
++
++class X86UnchangedTest(unittest.TestCase):
++    def test_na_memory_still_skipped_on_x86(self):
++        with mock.patch.object(setup, "ARM64", False), mock.patch.object(setup, "out", lambda cmd: SPARK_SMI):
++            self.assertEqual(setup.gpus(), [])
++
++    def test_discrete_card_unchanged(self):
++        smi = "0, NVIDIA GeForce RTX 5090, 32607, 12.0, 580.88\n"
++        with mock.patch.object(setup, "ARM64", False), mock.patch.object(setup, "out", lambda cmd: smi):
++            g = setup.gpus()[0]
++        self.assertNotIn("uma", g)
++        self.assertAlmostEqual(g["vram_gb"], 32607 / 1024.0)
++
++    def test_x86_floor_unchanged(self):
++        with mock.patch.object(setup, "ARM64", False), mock.patch.dict(os.environ, {"STRATA_ISA_FLOOR": ""}):
++            self.assertEqual(setup.cpu_floor(True), "")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/vision/CMakeLists.txt b/tools/vision/CMakeLists.txt
+index d6518c7..7b15317 100644
+--- a/tools/vision/CMakeLists.txt
++++ b/tools/vision/CMakeLists.txt
+@@ -29,7 +29,12 @@ set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+ set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
+ set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
+ set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+-if(STRATA_PORTABLE)
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
++  # aarch64 (the DGX Spark, docs/DGX_SPARK.md): always built for this PC; STRATA_PORTABLE's AVX2 baseline is x86
++  set(GGML_OPENMP ON CACHE BOOL "" FORCE)
++  include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/arm_arch.cmake)
++  strata_arm_ggml_arch()
++elseif(STRATA_PORTABLE)
+   set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+   set(GGML_OPENMP OFF CACHE BOOL "" FORCE)        # no vcomp140.dll / libgomp needed on the user's PC
+   foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
