@@ -7,3 +7,9 @@ bench/prompts/** -text
 
 # copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
 tests/data/native_experts/** -text
+
+# files read on Linux (Docker builds, CMake, Python) keep LF even from a Windows clone with autocrlf
+Dockerfile* text eol=lf
+*.py text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
