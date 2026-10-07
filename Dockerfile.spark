@@ -13,7 +13,7 @@
 #   docker run -d --name strata --gpus all -p 127.0.0.1:8080:8080 #     --ulimit memlock=-1 -v strata-data:/data #     -e FAMILY=unsloth -e MODEL=UD-IQ4_XS strata-spark
 #
 # Setup choices are the env vars ./Dockerfile lists (FAMILY, MODEL, CONTEXT, VISION,
-# KV, LOW_RAM, HOST, PORT, API_KEY, GGUF_DIR, ...).  Q2_0 is not offered on ARM:
+# KV, LOW_RAM, HOST, PORT, API_KEY, GGUF_DIR, MODEL_ALIASES, ...).  Q2_0 is not offered on ARM:
 # its pack needs Strata's x86 AVX-512 kernels.  Add -e API_KEY=<secret> before
 # publishing the port beyond 127.0.0.1.
 

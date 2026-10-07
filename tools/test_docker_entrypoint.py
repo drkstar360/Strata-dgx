@@ -7,6 +7,7 @@ Windows).
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -36,8 +37,10 @@ class Entrypoint(unittest.TestCase):
         self.script = self.tmp / "entry.sh"
         self.script.write_text(script, encoding="utf-8")
 
-    def run_entry(self, reinstall):
+    def run_entry(self, reinstall, **extra):
         env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
+        env.pop("MODEL_ALIASES", None)                               # only what the test sets
+        env.update(extra)
         r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
@@ -61,6 +64,30 @@ class Entrypoint(unittest.TestCase):
         self.assertIn("from-setup", cfg.read_text())
         cfg.write_text('{"args": ["edited-later"]}\n')
         self.assertIn("edited-later", self.run_entry("0"))           # the regular file setup left is replaced by the link
+
+    def test_model_aliases_reach_the_config_that_starts_on_the_first_setup(self):
+        out = self.run_entry("0", MODEL_ALIASES=" qwen, local-model ,")
+        self.assertIn('"aliases": [', out)                           # the copy setup left in opt, which starts now
+        self.assertIn('"local-model"', out)
+        cfg = json.loads((self.data / "config" / "strata-iq3_s.json").read_text())
+        self.assertEqual(cfg["aliases"], ["qwen", "local-model"])
+        self.assertEqual(cfg["args"], ["from-setup"])               # the rest of the config is kept
+
+    def test_model_aliases_replace_the_volume_configs(self):
+        cfg = self.data / "config" / "strata-iq3_s.json"
+        cfg.write_text('{"args": ["on-volume"], "aliases": ["old"], "sampling": {"temperature": 0.6}}\n')
+        self.run_entry("0", MODEL_ALIASES="gpt-local")
+        got = json.loads(cfg.read_text())
+        self.assertEqual(got["aliases"], ["gpt-local"])
+        self.assertEqual(got["sampling"], {"temperature": 0.6})
+        self.assertTrue((self.opt / "strata-iq3_s.json").is_symlink())   # still the link, not a copy
+
+    def test_unset_model_aliases_leave_the_config_alone(self):
+        cfg = self.data / "config" / "strata-iq3_s.json"
+        text = '{"args": ["on-volume"], "aliases": ["from-web-page"]}\n'
+        cfg.write_text(text)
+        self.run_entry("0")
+        self.assertEqual(cfg.read_text(), text)
 
 
 if __name__ == "__main__":
