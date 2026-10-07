@@ -25,6 +25,7 @@
 #include <immintrin.h>
 #define STRATA_SPIN_PAUSE() _mm_pause()
 #else
+#include "strata/platform/spin.hpp"   // _mm_sfence (below) on aarch64
 #define STRATA_SPIN_PAUSE() ((void) 0)
 #endif
 

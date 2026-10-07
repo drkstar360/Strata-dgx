@@ -54,7 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <immintrin.h>
+#include "strata/platform/spin.hpp"   // <immintrin.h> on x86
 
 namespace strata::core {
 namespace {

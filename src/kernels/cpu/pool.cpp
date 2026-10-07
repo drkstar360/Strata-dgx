@@ -7,7 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
+#include "strata/platform/spin.hpp"   // <immintrin.h> on x86
 
 #include <cstdio>
 #include <cstdlib>
