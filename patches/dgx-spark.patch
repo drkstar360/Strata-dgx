@@ -19,10 +19,10 @@ index 4f341af..2483cb0 100644
 +/.env
 diff --git a/.env.example b/.env.example
 new file mode 100644
-index 0000000..a1d6fbb
+index 0000000..2f8e9ce
 --- /dev/null
 +++ b/.env.example
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,66 @@
 +# Settings for docker-compose.spark.yml (Strata on a DGX Spark, docs/DGX_SPARK.md).
 +# Copy this file to .env in the project root and change what you need; Docker Compose reads .env by itself:
 +#   cp .env.example .env
@@ -42,12 +42,23 @@ index 0000000..a1d6fbb
 +VISION=yes
 +# KV cache: empty (setup's default, int8) | int8 | q4_0 | k8v4
 +KV=
++# from a 64K context: keep the KV cache in RAM and only the attention's window in GPU memory (more experts fit on the
++# GPU). empty (setup's default, auto: when the RAM has room) | auto | on | off. The Spark's GPU memory IS the RAM, so
++# this saves nothing there; not measured either way
++KV_STREAMING=
++# read the experts from the model's files instead of copying them all into RAM, for a PC with little RAM:
++# auto (when they would not fit) | on | off | resident | mmap. Every model fits the Spark's 128 GB, so auto keeps it off
++LOW_RAM=auto
++# UD-IQ4_XS / UD-Q4_K_XL: the GiB of the experts kept in RAM, the rest read from the SSD. empty: setup's pick (the RAM
++# less 24 GB, at most all of them: 55 for UD-IQ4_XS, which is all of its experts on the Spark)
++RESIDENT_BUDGET_GIB=
 +
 +# GGUF files you already have, so nothing is downloaded: the path INSIDE the container. Uncomment the /ggufs mount in
 +# docker-compose.spark.yml (with the folder on the Spark), then set GGUF_DIR=/ggufs
 +GGUF_DIR=
 +
-+# 1: run setup again on the next start, to change CONTEXT, VISION, KV or API_KEY for a model already set up.
++# 1: run setup again on the next start, to change CONTEXT, VISION, KV, KV_STREAMING, LOW_RAM, RESIDENT_BUDGET_GIB or
++# API_KEY for a model already set up.
 +# Set it back to 0 afterwards
 +REINSTALL=0
 +
@@ -400,10 +411,10 @@ index 0000000..891764f
 +endfunction()
 diff --git a/docker-compose.spark.yml b/docker-compose.spark.yml
 new file mode 100644
-index 0000000..158af9e
+index 0000000..9870b7e
 --- /dev/null
 +++ b/docker-compose.spark.yml
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,60 @@
 +# Strata on an NVIDIA DGX Spark (docs/DGX_SPARK.md), with Docker Compose.  Run from the project root, ON THE SPARK:
 +#
 +#   mkdir -p strata-data                                  # so the folder is yours, not root's
@@ -449,6 +460,9 @@ index 0000000..158af9e
 +      API_KEY: "${API_KEY:-}"
 +      GGUF_DIR: "${GGUF_DIR:-}"
 +      KV: "${KV:-}"
++      KV_STREAMING: "${KV_STREAMING:-}"
++      LOW_RAM: "${LOW_RAM:-auto}"
++      RESIDENT_BUDGET_GIB: "${RESIDENT_BUDGET_GIB:-}"
 +      MODEL_ALIASES: "${MODEL_ALIASES:-}"
 +      EXPERT_CACHE: "${EXPERT_CACHE:-}"
 +      # the GiB of RAM the engine leaves to the OS when it sizes GPU memory (the engine reads it directly)
@@ -512,10 +526,10 @@ index 64d096b..c2bfa6f 100755
  # GPUS / GPU / LAYER_SPLIT are repeated on purpose. Given at the start they pin the
 diff --git a/docs/DGX_SPARK.md b/docs/DGX_SPARK.md
 new file mode 100644
-index 0000000..5eeca60
+index 0000000..3b844d7
 --- /dev/null
 +++ b/docs/DGX_SPARK.md
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,234 @@
 +# NVIDIA DGX Spark (GB10, aarch64): build from source
 +
 +This fork ports Strata to the NVIDIA DGX Spark: a 20-core ARM Grace CPU (aarch64, NEON/SVE2, no x86 instructions), a Blackwell
@@ -648,7 +662,8 @@ index 0000000..5eeca60
 +Its settings come from the environment or a `.env` file in the project root: `cp .env.example .env` and edit it. The
 +example lists every setting with what it does; `.env` holds the API key, so `.gitignore` and `.dockerignore` leave it out.
 +The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT` (`65536`), `VISION` (`no`), `API_KEY`,
-+`GGUF_DIR`, `KV`, `MODEL_ALIASES`, `EXPERT_CACHE`, `UMA_HEADROOM_GIB` (`6`), `REINSTALL`, `STRATA_PORT` (`8080`),
++`GGUF_DIR`, `KV`, `KV_STREAMING`, `LOW_RAM` (`auto`), `RESIDENT_BUDGET_GIB`, `MODEL_ALIASES`, `EXPERT_CACHE`,
++`UMA_HEADROOM_GIB` (`6`), `REINSTALL`, `STRATA_PORT` (`8080`),
 +`BUILD_VISION` (`1`). `MODEL_ALIASES=qwen,local-model` gives the model other names: `/v1/models` lists them, and a
 +request naming one is answered under it. The entrypoint writes them into the config's `aliases` on every start (the
 +same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay.
