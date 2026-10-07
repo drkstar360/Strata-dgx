@@ -52,6 +52,12 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
   set(STRATA_ARM64 ON)
   add_compile_definitions(STRATA_ARM64=1)
+  # GCC on aarch64 fuses a*b+c into one FMA by default (-ffp-contract=fast), which an x86 build without -mfma never
+  # does: host code that rounds a product and then adds (ggml's nearest_int, the parity references) then lands on the
+  # other side of a tie.  Off, the host arithmetic is the x86 build's; NEON code with explicit FMA intrinsics is not
+  # affected, nor is device code (nvcc's --fmad).
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>
+                      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
   if(STRATA_PORTABLE OR STRATA_ISA_FLOOR)
     message(FATAL_ERROR "STRATA_PORTABLE and STRATA_ISA_FLOOR are x86 builds; on aarch64 leave both unset")
   endif()
