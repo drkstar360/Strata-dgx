@@ -127,7 +127,9 @@ docker compose -f docker-compose.spark.yml logs -f
 curl -fs http://127.0.0.1:8080/health
 ```
 
-Its settings come from the environment or a `.env` file: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT`
+Its settings come from the environment or a `.env` file in the project root: `cp .env.example .env` and edit it. The
+example lists every setting with what it does; `.env` holds the API key, so `.gitignore` and `.dockerignore` leave it out.
+The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT`
 (`65536`), `VISION` (`no`), `API_KEY`, `GGUF_DIR`, `KV`, `REINSTALL`, `STRATA_PORT` (`8080`), `BUILD_VISION` (`1`). For GGUF
 files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container runs as root, so
 the files it writes in `strata-data/` are owned by root.

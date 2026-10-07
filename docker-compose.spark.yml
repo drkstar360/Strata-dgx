@@ -9,8 +9,8 @@
 # and outside the image: .dockerignore and .gitignore leave that folder out.  The first start sets the model up there
 # (UD-IQ4_XS downloads 94 GB unless GGUF_DIR points at files you already have); later starts serve straight away.
 #
-# Settings come from the environment or a .env file next to this one, for example:
-#   FAMILY=unsloth  MODEL=UD-IQ4_XS  CONTEXT=65536  VISION=no  API_KEY=<secret>  STRATA_PORT=8080
+# Settings come from the environment or a .env file next to this one: `cp .env.example .env` and edit it (it lists
+# every setting with its default; .env is kept out of git and out of the image).
 # REINSTALL=1 changes the settings of a model that is already set up.  Q2_0 is not offered on ARM (its pack needs x86
 # AVX-512).  The port is published on 127.0.0.1 only: set API_KEY before opening it to a network.
 

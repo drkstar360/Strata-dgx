@@ -26,3 +26,6 @@ strata-*.json
 strata-*.txt
 run-*.sh
 run-*.bat
+
+# docker-compose.spark.yml settings: may hold the API key, never baked into the image
+/.env
