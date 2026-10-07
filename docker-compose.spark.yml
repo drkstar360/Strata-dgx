@@ -43,6 +43,9 @@ services:
       API_KEY: "${API_KEY:-}"
       GGUF_DIR: "${GGUF_DIR:-}"
       KV: "${KV:-}"
+      KV_STREAMING: "${KV_STREAMING:-}"
+      LOW_RAM: "${LOW_RAM:-auto}"
+      RESIDENT_BUDGET_GIB: "${RESIDENT_BUDGET_GIB:-}"
       MODEL_ALIASES: "${MODEL_ALIASES:-}"
       EXPERT_CACHE: "${EXPERT_CACHE:-}"
       # the GiB of RAM the engine leaves to the OS when it sizes GPU memory (the engine reads it directly)
