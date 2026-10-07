@@ -30,6 +30,7 @@ td.log
 /build/
 /third_party/llama.cpp
 /models/
+/strata-data/
 /packs/
 /mtp/
 /run-*.bat

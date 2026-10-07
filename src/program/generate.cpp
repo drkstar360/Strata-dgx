@@ -2316,6 +2316,11 @@ int main(int argc, char** argv) {
     // next.  Refused here, by name, rather than an illegal instruction in the first expert.
     // The experimental older-CPU build (STRATA_ISA_FLOOR=avx|none, compiled on that PC; #394 #595 #623) has ggml-cpu
     // for that floor, so a native pack's experts run there on ggml-cpu (every AVX2 kernel is behind cpu_avx2_ok).
+#if defined(STRATA_ARM64)
+    // The aarch64 build (docs/DGX_SPARK.md) has no x86 kernels at all: ggml-cpu, compiled for this CPU, computes the
+    // CPU's expert rows, and the canonical AVX-512 pack is refused below (cpu_require_expert_support).
+    std::fprintf(stderr, "strata generate: aarch64 build: the CPU's experts run on ggml-cpu (NEON/SVE)\n");
+#else
     const char* isa_floor = strata::kernels::cpu::isa_floor_build();
     if (!strata::kernels::cpu::cpu_avx2_ok() && isa_floor[0] == '\0') {
         std::fprintf(stderr, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
@@ -2341,6 +2346,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: this is the older-CPU build (ggml-cpu for %s); this CPU has AVX2, "
                                  "and the normal build is faster on it\n", isa_floor);
     }
+#endif
 
     std::string err;
     if (!o.native_head_gguf.empty() && !o.stream_token) {
@@ -2410,11 +2416,13 @@ int main(int argc, char** argv) {
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
+#if !defined(STRATA_ARM64)    // said above on aarch64
     else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
                      !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+#endif
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,

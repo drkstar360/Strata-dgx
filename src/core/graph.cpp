@@ -1,7 +1,7 @@
 // src/core/graph.cpp - P2.S5: the GraphRegistry implementation.
 #include "strata/core/graph.hpp"
 
-#include <immintrin.h>
+#include "strata/platform/spin.hpp"   // <immintrin.h> on x86
 
 #include <chrono>
 #include <cstdio>

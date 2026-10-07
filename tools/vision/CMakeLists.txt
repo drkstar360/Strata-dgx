@@ -29,7 +29,12 @@ set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
-if(STRATA_PORTABLE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  # aarch64 (the DGX Spark, docs/DGX_SPARK.md): always built for this PC; STRATA_PORTABLE's AVX2 baseline is x86
+  set(GGML_OPENMP ON CACHE BOOL "" FORCE)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/arm_arch.cmake)
+  strata_arm_ggml_arch()
+elseif(STRATA_PORTABLE)
   set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
   set(GGML_OPENMP OFF CACHE BOOL "" FORCE)        # no vcomp140.dll / libgomp needed on the user's PC
   foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)

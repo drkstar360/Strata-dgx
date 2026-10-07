@@ -1,0 +1,53 @@
+# Strata on an NVIDIA DGX Spark (docs/DGX_SPARK.md), with Docker Compose.  Run from the project root, ON THE SPARK:
+#
+#   mkdir -p strata-data                                  # so the folder is yours, not root's
+#   docker compose -f docker-compose.spark.yml up -d --build
+#   docker compose -f docker-compose.spark.yml logs -f
+#   curl -fs http://127.0.0.1:8080/health
+#
+# The model files, the pack and the install config live in ./strata-data (the container's /data), beside the source
+# and outside the image: .dockerignore and .gitignore leave that folder out.  The first start sets the model up there
+# (UD-IQ4_XS downloads 94 GB unless GGUF_DIR points at files you already have); later starts serve straight away.
+#
+# Settings come from the environment or a .env file next to this one, for example:
+#   FAMILY=unsloth  MODEL=UD-IQ4_XS  CONTEXT=65536  VISION=no  API_KEY=<secret>  STRATA_PORT=8080
+# REINSTALL=1 changes the settings of a model that is already set up.  Q2_0 is not offered on ARM (its pack needs x86
+# AVX-512).  The port is published on 127.0.0.1 only: set API_KEY before opening it to a network.
+
+services:
+  strata:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+      args:
+        CUDA_ARCHITECTURES: "121"
+        BUILD_VISION: "${BUILD_VISION:-1}"         # 0: no image encoder, a faster build
+    image: strata-spark
+    container_name: strata
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${STRATA_PORT:-8080}:8080"
+    ulimits:
+      memlock:                                     # the engine locks part of the RAM for the GPU
+        soft: -1
+        hard: -1
+    volumes:
+      - ./strata-data:/data
+      # GGUF files you already have (then set GGUF_DIR=/ggufs):
+      # - /path/to/ggufs:/ggufs:ro
+    environment:
+      FAMILY: "${FAMILY:-unsloth}"
+      MODEL: "${MODEL:-UD-IQ4_XS}"
+      CONTEXT: "${CONTEXT:-65536}"
+      VISION: "${VISION:-no}"
+      API_KEY: "${API_KEY:-}"
+      GGUF_DIR: "${GGUF_DIR:-}"
+      KV: "${KV:-}"
+      REINSTALL: "${REINSTALL:-0}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

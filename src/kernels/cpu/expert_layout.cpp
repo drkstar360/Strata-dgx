@@ -8,7 +8,7 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
-#else
+#elif !defined(STRATA_ARM64)
 #include <cpuid.h>
 #endif
 #include <fstream>
@@ -37,6 +37,15 @@ int cpu_isa_cap() {
     return cap;
 }
 
+#if defined(STRATA_ARM64)
+// The aarch64 build (docs/DGX_SPARK.md): no x86 feature is here, so every check says no and the engine takes the
+// paths a CPU without AVX2 takes - ggml-cpu (NEON/SVE) for the experts, the plain C++ router dot.
+bool cpu_avx512_ok() { return false; }
+bool cpu_avx512bw_ok() { return false; }
+bool cpu_avx2_ok() { return false; }
+bool cpu_avx1_ok() { return false; }
+bool cpu_sse42_ok() { return false; }
+#else
 bool cpu_avx512_ok() {
     static const bool ok = [] {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
@@ -175,6 +184,7 @@ bool cpu_sse42_ok() {
     }();
     return ok;
 }
+#endif
 
 const char* isa_floor_build() {
 #if defined(STRATA_ISA_FLOOR_AVX)
@@ -186,6 +196,7 @@ const char* isa_floor_build() {
 #endif
 }
 
+#if !defined(STRATA_ARM64)
 namespace {
 void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
 #if defined(_MSC_VER)
@@ -197,6 +208,7 @@ void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
 #endif
 }
 }  // namespace
+#endif
 
 int iq256_gather_setting() {
     static const int s = [] {
@@ -207,6 +219,12 @@ int iq256_gather_setting() {
     return s;
 }
 
+#if defined(STRATA_ARM64)
+bool cpu_gather_fast() { return false; }
+bool cpu_gather_fast_here() { return false; }
+bool cpu_avxvnni_ok() { return false; }
+std::string cpu_name() { return "aarch64"; }   // /proc/cpuinfo names no model on ARM, only part numbers
+#else
 bool cpu_gather_fast() {
     static const bool ok = [] {
         if (cpu_isa_cap() < 3) return false;   // STRATA_FORCE_ISA: as on a CPU that stops at AVX2
@@ -285,6 +303,7 @@ std::string cpu_name() {
     const size_t b0 = name.find_first_not_of(' '), b1 = name.find_last_not_of(' ');
     return b0 == std::string::npos ? std::string("unknown") : name.substr(b0, b1 - b0 + 1);
 }
+#endif
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
