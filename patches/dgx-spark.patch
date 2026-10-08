@@ -139,7 +139,7 @@ index acca09f..7c21fa3 100644
 +# docker-compose.spark.yml settings: may hold the API key (.env.example is the template)
 +/.env
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 10728a4..e364187 100644
+index 65c6cc5..231db26 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -47,6 +47,21 @@ endif()
@@ -647,13 +647,13 @@ index 0000000..972bb36
 +              count: all
 +              capabilities: [gpu]
 diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
-index 64d096b..4993c26 100755
+index 2950a25..31db661 100755
 --- a/docker-entrypoint.sh
 +++ b/docker-entrypoint.sh
-@@ -22,6 +22,21 @@ LOW_RAM="${LOW_RAM:-auto}"      # on: the experts come from the pack's experts.b
- GGUF_DIR="${GGUF_DIR:-}"        # a mounted folder with GGUF files you already have: no download
+@@ -23,6 +23,21 @@ GGUF_DIR="${GGUF_DIR:-}"        # a mounted folder with GGUF files you already h
  RESIDENT_BUDGET_GIB="${RESIDENT_BUDGET_GIB:-}"   # UD-Q4_K_XL: GiB of experts kept in RAM (default: setup's pick)
  KV_STREAMING="${KV_STREAMING:-}" # auto | on | off; empty: setup.py's own default (auto)
+ CONFIG="${CONFIG:-}"            # a config file to start with (wins over MODEL's /data/config/strata-<model>.json)
 +STRATA_BIND="${STRATA_BIND:-127.0.0.1}"   # docker-compose.spark.yml: the host address the port is published on
 +
 +# Never reachable beyond this machine without an API key (AGENTS.md): docker-compose.spark.yml publishes the port on
@@ -672,13 +672,14 @@ index 64d096b..4993c26 100755
  
  # setup.py starts the newest strata-*.json it finds, so link in exactly the one
  # this family and model were set up with. The config is the recorded output of
-@@ -64,6 +79,52 @@ else
-   ln -sfn "$cfg" "/opt/strata/strata-$tag.json"
+@@ -83,6 +98,54 @@ else
+   echo "Config: $cfg (from MODEL $MODEL)"
  fi
  
-+# Settings applied to the model's config on every start, after any setup pass (which rewrites the engine's args), in
-+# the config on the volume and in the one that starts (a copy after a setup pass, else the link to it). Unset, the
-+# config's own value stays (what the web page or an earlier start wrote).
++# Settings applied on every start, after any setup pass (which rewrites the engine's args), to the config that starts
++# (the file the link points to, or the copy a setup pass left) and, when that is MODEL's own, to its copy on the volume.
++# A config chosen with CONFIG or a kept link is the only one changed. Unset, the config's own value stays (what the web
++# page or an earlier start wrote).
 +#  MODEL_ALIASES ("qwen,local-model"): other names the model answers to and /v1/models lists (the config's "aliases",
 +#    docs/DETAILS.md "Model aliases").
 +#  EXPERT_CACHE (auto | N): the engine's --expert-cache, the GPU's copy of the most-used experts in slots of one expert
@@ -687,7 +688,8 @@ index 64d096b..4993c26 100755
 +#  PARALLEL (N): up to N requests decode together in the engine's batch slots, the config's "parallel"
 +#    (docs/BATCHING.md); 1 is one at a time, more wait their turn. The server caps it at 8 and says so.
 +if [ -n "${MODEL_ALIASES:-}" ] || [ -n "${EXPERT_CACHE:-}" ] || [ -n "${PARALLEL:-}" ]; then
-+  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "${PARALLEL:-}" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
++  if [ -n "$CONFIG" ] || [ -n "$keep" ]; then also="$link"; else also="$cfg"; fi
++  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "${PARALLEL:-}" "$link" "$also" <<'PYEOF'
 +import json, os, sys
 +aliases, cache, parallel = sys.argv[1], sys.argv[2].strip().lower(), sys.argv[3].strip()
 +if cache and cache != "auto" and not (cache.isdigit() and int(cache) > 0):
@@ -727,7 +729,7 @@ index 64d096b..4993c26 100755
  # GPUS / GPU / LAYER_SPLIT are repeated on purpose. Given at the start they pin the
 diff --git a/docs/DGX_SPARK.md b/docs/DGX_SPARK.md
 new file mode 100644
-index 0000000..d4bd062
+index 0000000..34d03bd
 --- /dev/null
 +++ b/docs/DGX_SPARK.md
 @@ -0,0 +1,284 @@
@@ -898,7 +900,7 @@ index 0000000..d4bd062
 +## Applying the port to a newer upstream
 +
 +`patches/dgx-spark.patch` is the whole port as one patch against upstream `main` (Niko1221/Strata). It holds every change
-+listed above, this document included. Applied to upstream commit `e8ca9af` it gives exactly this fork's tree.
++listed above, this document included. Applied to upstream commit `6674a00` (0.1.40.4) it gives exactly this fork's tree.
 +
 +On a fresh upstream checkout:
 +
@@ -1035,10 +1037,10 @@ index 0000000..a6af3d4
 +#include <immintrin.h>
 +#endif
 diff --git a/setup.py b/setup.py
-index 14d982c..9869c7b 100644
+index 904c928..cbc5226 100644
 --- a/setup.py
 +++ b/setup.py
-@@ -59,6 +59,9 @@ from pathlib import Path
+@@ -60,6 +60,9 @@ from pathlib import Path
  
  ROOT = Path(__file__).resolve().parent
  WIN = os.name == "nt"
@@ -1048,7 +1050,7 @@ index 14d982c..9869c7b 100644
  # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
  # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
  # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
-@@ -608,6 +611,10 @@ def cpu_info():
+@@ -609,6 +612,10 @@ def cpu_info():
          n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
          name = n or name
          avx512 = bool(pf(41)) and _cpuid_avx512_full()
@@ -1059,7 +1061,7 @@ index 14d982c..9869c7b 100644
      else:
          try:
              txt = open("/proc/cpuinfo").read()
-@@ -646,6 +653,8 @@ def cpu_floor(avx2: bool) -> str:
+@@ -647,6 +654,8 @@ def cpu_floor(avx2: bool) -> str:
      """The experimental older-CPU build this PC needs (#394 #595 #623): "" with AVX2 (the normal engine), "avx" (Sandy /
      Ivy Bridge, AMD Bulldozer), "none" (SSE4.2 + POPCNT: Nehalem, Westmere), or "unsupported".  STRATA_ISA_FLOOR=avx|
      none asks for that build on any PC (testing it on a newer one)."""
@@ -1068,7 +1070,7 @@ index 14d982c..9869c7b 100644
      forced = os.environ.get("STRATA_ISA_FLOOR", "").strip().lower()
      if forced in ("avx", "none"):
          return forced
-@@ -733,6 +742,11 @@ def gpus():
+@@ -734,6 +743,11 @@ def gpus():
      for line in s.strip().splitlines():
          try:
              idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
@@ -1080,7 +1082,7 @@ index 14d982c..9869c7b 100644
              found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
                            "driver": drv})
          except ValueError:
-@@ -1767,6 +1781,17 @@ def amd_apply_uma(g: dict, gtt_gb: float = 0.0, ram: float | None = None) -> dic
+@@ -1768,6 +1782,17 @@ def amd_apply_uma(g: dict, gtt_gb: float = 0.0, ram: float | None = None) -> dic
      return g
  
  
@@ -1098,7 +1100,20 @@ index 14d982c..9869c7b 100644
  def low_ram_vram(g) -> float:
      """The GPU memory the low-RAM mode may count as room beside the RAM: a discrete card's VRAM; an APU's BIOS
      carve-out only (its shared memory is the RAM itself)."""
-@@ -2696,6 +2721,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
+@@ -1786,6 +1811,12 @@ STRIX_HALO_FAMILY, STRIX_HALO_MODEL = "unsloth", "UD-IQ4_XS"    # the model docs
+ STRIX_HALO_MIN_GB = 80         # UD-IQ4_XS keeps all of its experts in memory from ~80 GB (its menu line says so)
+ 
+ 
++def spark_recommends(gpu, ram) -> bool:
++    """An ARM64 PC whose NVIDIA GPU shares the RAM (GB10, DGX Spark: nvidia_apply_uma) recommends UD-IQ4_XS from the same
++    memory as Strix Halo: all of its experts fit (docs/DGX_SPARK.md).  A recommendation only: every size is listed."""
++    return ARM64 and bool(gpu.get("uma")) and ram + gpu.get("dedicated_gb", 0.0) >= STRIX_HALO_MIN_GB
++
++
+ def strix_halo_recommends(gpu, ram) -> bool:
+     """Is UD-IQ4_XS the recommended model here: a Strix Halo whose unified memory (the OS's RAM plus the BIOS carve-out)
+     holds it - the model docs/STRIX_HALO.md measures.  A recommendation only: the menus still list every size."""
+@@ -2756,6 +2787,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
      """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
      updating: called to replace an installed engine, which starts instead when this fails (no compile).
      toolkit 12: the experimental CUDA 12 engine (CUDA12_ASSET) in engine-cuda12/."""
@@ -1107,7 +1122,7 @@ index 14d982c..9869c7b 100644
      eng = engine_dir(toolkit)
      asset = CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
      info = eng / "BUILD.json"
-@@ -2979,7 +3006,11 @@ def install_build_tools(gpu, yes):
+@@ -3039,7 +3072,11 @@ def install_build_tools(gpu, yes):
                  fail("the CUDA Toolkit can be installed automatically on Ubuntu 22.04 / 24.04 only",
                       "install it from https://developer.nvidia.com/cuda-downloads and run it again")
              deb = Path("/tmp/cuda-keyring.deb")
@@ -1120,7 +1135,7 @@ index 14d982c..9869c7b 100644
                       deb, "CUDA repository key")
              run(["sudo", "dpkg", "-i", str(deb)])
              run(["sudo", "apt-get", "update"])
-@@ -4736,7 +4767,9 @@ def main() -> int:
+@@ -4803,7 +4840,9 @@ def main() -> int:
          gpu["archs"] = sorted({x["arch"] for x in chosen})  # the engine needs code for every one of them
          if multi:
              ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
@@ -1131,7 +1146,7 @@ index 14d982c..9869c7b 100644
          cuda_tk, why = cuda_choice(gpu["archs"], a.cuda)   # one engine per model: its oldest card decides
          if why:
              (warn if cuda_tk == 13 or str(a.cuda) == "12" else ok)(f"CUDA {cuda_tk}: {why}")
-@@ -4773,8 +4806,10 @@ def main() -> int:
+@@ -4840,8 +4879,10 @@ def main() -> int:
          warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
               "the model may not start or may use less VRAM. Set it to \"System managed\": System > About > "
               "Advanced system settings > Performance > Advanced > Virtual memory")
@@ -1144,7 +1159,7 @@ index 14d982c..9869c7b 100644
      if link is not None:
          line, problem = pcie_lines(link)
          ok(line)
-@@ -4783,7 +4818,9 @@ def main() -> int:
+@@ -4850,7 +4891,9 @@ def main() -> int:
      floor = cpu_floor(avx2)
      if floor == "unsupported":
          fail("this CPU has neither AVX2 nor SSE4.2; Strata needs at least SSE4.2 (Intel Nehalem, 2008, or newer)")
@@ -1155,7 +1170,13 @@ index 14d982c..9869c7b 100644
          # #394 #595 #623: the ready-made engine is AVX2; an older CPU gets one compiled here, whose CPU experts run on
          # ggml-cpu's kernels for this CPU.  Experimental: measured only on newer CPUs with the older path forced, and by
          # users on a few Xeons.  A warning, not a stop.
-@@ -4831,7 +4868,8 @@ def main() -> int:
+@@ -4894,11 +4937,13 @@ def main() -> int:
+     if a.family:
+         family = a.family
+     else:
+-        rec_fam = STRIX_HALO_FAMILY if strix_halo_recommends(gpu, ram) and STRIX_HALO_FAMILY in fams else fams[0]
++        uma_rec = strix_halo_recommends(gpu, ram) or spark_recommends(gpu, ram)
++        rec_fam = STRIX_HALO_FAMILY if uma_rec and STRIX_HALO_FAMILY in fams else fams[0]
          for i, f in enumerate(fams, 1):
              d = FAMILIES[f]
              say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
@@ -1165,7 +1186,7 @@ index 14d982c..9869c7b 100644
          family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)],
                                str(fams.index(rec_fam) + 1), a.yes)) - 1]
      fam = FAMILIES[family]
-@@ -4840,6 +4878,8 @@ def main() -> int:
+@@ -4907,6 +4952,8 @@ def main() -> int:
          say(f"  Its license: {fam['license']}")
      say()
      names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
@@ -1455,7 +1476,7 @@ index 0000000..974d2f3
 +
 +}  // namespace strata::kernels::cpu
 diff --git a/src/program/generate.cpp b/src/program/generate.cpp
-index a78d088..5efb2df 100644
+index ce8e004..3711369 100644
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
 @@ -2316,6 +2316,11 @@ int main(int argc, char** argv) {
@@ -1493,7 +1514,7 @@ index a78d088..5efb2df 100644
      int64_t K = 10;
      // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
 diff --git a/tools/test_docker_entrypoint.py b/tools/test_docker_entrypoint.py
-index 3e185a6..28fd690 100644
+index 4953265..d998aff 100644
 --- a/tools/test_docker_entrypoint.py
 +++ b/tools/test_docker_entrypoint.py
 @@ -7,6 +7,7 @@ Windows).
@@ -1504,7 +1525,7 @@ index 3e185a6..28fd690 100644
  import os
  import shutil
  import subprocess
-@@ -30,17 +31,24 @@ class Entrypoint(unittest.TestCase):
+@@ -30,17 +31,25 @@ class Entrypoint(unittest.TestCase):
          # the stub "python": setup.py --setup writes the config the way setup does; a plain start prints what it would load
          stub = self.opt / ".venv" / "bin" / "python"
          stub.write_text('#!/bin/sh\nif [ "$2" = "--setup" ]; then echo \'{"args": ["from-setup"]}\' > strata-iq3_s.json\n'
@@ -1516,10 +1537,12 @@ index 3e185a6..28fd690 100644
          self.script = self.tmp / "entry.sh"
          self.script.write_text(script, encoding="utf-8")
  
--    def run_entry(self, reinstall):
+-    def run_entry(self, reinstall, **extra):
+-        env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall, **extra)
 +    def run_entry(self, reinstall, rc=0, **extra):
-         env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
-+        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "PARALLEL", "API_KEY", "STRATA_API_KEY", "STRATA_BIND"):   # only what the test sets
++        env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
++        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "PARALLEL", "API_KEY", "STRATA_API_KEY", "STRATA_BIND",
++                  "CONFIG"):                                     # only what the test sets
 +            env.pop(k, None)
 +        env.update(extra)
          r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
@@ -1533,9 +1556,9 @@ index 3e185a6..28fd690 100644
  
      def test_edited_volume_config_wins_over_a_regular_file_in_opt(self):
          (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["edited", "--kv-resident", "32768"]}\n')
-@@ -62,6 +70,92 @@ class Entrypoint(unittest.TestCase):
-         cfg.write_text('{"args": ["edited-later"]}\n')
-         self.assertIn("edited-later", self.run_entry("0"))           # the regular file setup left is replaced by the link
+@@ -95,6 +104,102 @@ class Entrypoint(unittest.TestCase):
+         self.assertIn("by-model", out)
+         self.assertIn(f"Config: {self.data}/config/strata-iq3_s.json", out)
  
 +    def test_model_aliases_reach_the_config_that_starts_on_the_first_setup(self):
 +        out = self.run_entry("0", MODEL_ALIASES=" qwen, local-model ,")
@@ -1603,6 +1626,16 @@ index 3e185a6..28fd690 100644
 +        self.run_entry("0")
 +        self.assertEqual(cfg.read_text(), text)
 +
++    def test_settings_change_only_the_config_chosen_with_config(self):
++        own = self.data / "config" / "strata-iq3_s.json"
++        text = '{"args": ["plain"]}\n'
++        own.write_text(text)
++        other = self.tmp / "mine.json"
++        other.write_text('{"args": ["mine"]}\n')
++        out = self.run_entry("0", CONFIG=str(other), PARALLEL="3")
++        self.assertIn('"parallel": 3', out)                         # the config that starts has it
++        self.assertEqual(json.loads(other.read_text())["parallel"], 3)
++        self.assertEqual(own.read_text(), text)                      # MODEL's own config is not touched
 +
 +    def test_bind_beyond_this_machine_needs_an_api_key(self):
 +        for bind in ("0.0.0.0", "192.168.1.210", "::"):
@@ -1628,10 +1661,10 @@ index 3e185a6..28fd690 100644
      unittest.main()
 diff --git a/tools/test_setup_arm64.py b/tools/test_setup_arm64.py
 new file mode 100644
-index 0000000..9442b5e
+index 0000000..440e817
 --- /dev/null
 +++ b/tools/test_setup_arm64.py
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,97 @@
 +"""Tests for setup.py on an ARM CPU (the DGX Spark, docs/DGX_SPARK.md): the CPU is named and never sent to the x86
 +floor checks, the GB10's "[N/A]" memory makes it a unified-memory GPU sized from the RAM, no ready-made (x86) engine is
 +used, and on x86 nothing changes.  No compiler, no GPU.
@@ -1698,7 +1731,8 @@ index 0000000..9442b5e
 +        self.assertTrue(g["uma"])
 +        self.assertAlmostEqual(g["vram_gb"], SPARK_RAM - setup.UMA_OS_LEFT_GB)
 +        self.assertEqual(setup.low_ram_vram(g), 0.0)          # the RAM is not counted twice
-+        self.assertTrue(setup.strix_halo_recommends(g, SPARK_RAM))   # UD-IQ4_XS fits in the shared memory
++        self.assertTrue(setup.spark_recommends(g, SPARK_RAM))        # UD-IQ4_XS fits in the shared memory
++        self.assertFalse(setup.strix_halo_recommends(g, SPARK_RAM))  # upstream keeps that one to real Strix Halo
 +
 +    def test_no_ready_made_engine(self):
 +        self.assertIsNone(setup.get_prebuilt("https://example.invalid/", {"arch": "121"}, False))
@@ -1715,6 +1749,11 @@ index 0000000..9442b5e
 +            g = setup.gpus()[0]
 +        self.assertNotIn("uma", g)
 +        self.assertAlmostEqual(g["vram_gb"], 32607 / 1024.0)
++
++    def test_no_spark_recommendation_on_x86(self):
++        g = {"index": 0, "name": "AMD Radeon 8060S", "uma": True, "dedicated_gb": 2.0, "vram_gb": 66.0, "arch": "gfx1151"}
++        with mock.patch.object(setup, "ARM64", False):
++            self.assertFalse(setup.spark_recommends(g, SPARK_RAM))
 +
 +    def test_x86_floor_unchanged(self):
 +        with mock.patch.object(setup, "ARM64", False), mock.patch.dict(os.environ, {"STRATA_ISA_FLOOR": ""}):
