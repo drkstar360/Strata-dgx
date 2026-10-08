@@ -19,10 +19,10 @@ index 4f341af..2483cb0 100644
 +/.env
 diff --git a/.env.example b/.env.example
 new file mode 100644
-index 0000000..6bb6192
+index 0000000..5efcc8e
 --- /dev/null
 +++ b/.env.example
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,79 @@
 +# Settings for docker-compose.spark.yml (Strata on a DGX Spark, docs/DGX_SPARK.md).
 +# Copy this file to .env in the project root and change what you need; Docker Compose reads .env by itself:
 +#   cp .env.example .env
@@ -73,6 +73,12 @@ index 0000000..6bb6192
 +UMA_HEADROOM_GIB=6
 +
 +# ---- the server ----
++
++# requests served at once (the config's "parallel", docs/BATCHING.md): empty (keep the config's; one at a time after
++# setup) | 1 | 2..8. With N, up to N conversations decode together and more wait their turn; each slot takes ~0.6 GB at
++# a 32K context, and with KV streaming its whole KV cache also sits in RAM (~2.5 GB at 200K). Applied on every start,
++# no REINSTALL. Not measured on the Spark yet
++PARALLEL=
 +
 +# other names the model answers to and /v1/models lists, comma-separated (its own name stays, for example
 +# qwen3.8-flash-next-unsloth-ud-iq4_xs). A request naming an alias is answered under that name. Set, it replaces the
@@ -572,10 +578,10 @@ index 0000000..891764f
 +endfunction()
 diff --git a/docker-compose.spark.yml b/docker-compose.spark.yml
 new file mode 100644
-index 0000000..8d169e8
+index 0000000..972bb36
 --- /dev/null
 +++ b/docker-compose.spark.yml
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,64 @@
 +# Strata on an NVIDIA DGX Spark (docs/DGX_SPARK.md), with Docker Compose.  Run from the project root, ON THE SPARK:
 +#
 +#   mkdir -p strata-data                                  # so the folder is yours, not root's
@@ -629,6 +635,7 @@ index 0000000..8d169e8
 +      RESIDENT_BUDGET_GIB: "${RESIDENT_BUDGET_GIB:-}"
 +      MODEL_ALIASES: "${MODEL_ALIASES:-}"
 +      EXPERT_CACHE: "${EXPERT_CACHE:-}"
++      PARALLEL: "${PARALLEL:-}"
 +      # the GiB of RAM the engine leaves to the OS when it sizes GPU memory (the engine reads it directly)
 +      STRATA_UMA_HEADROOM_GIB: "${UMA_HEADROOM_GIB:-6}"
 +      REINSTALL: "${REINSTALL:-0}"
@@ -640,7 +647,7 @@ index 0000000..8d169e8
 +              count: all
 +              capabilities: [gpu]
 diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
-index 64d096b..291d099 100755
+index 64d096b..4993c26 100755
 --- a/docker-entrypoint.sh
 +++ b/docker-entrypoint.sh
 @@ -22,6 +22,21 @@ LOW_RAM="${LOW_RAM:-auto}"      # on: the experts come from the pack's experts.b
@@ -665,7 +672,7 @@ index 64d096b..291d099 100755
  
  # setup.py starts the newest strata-*.json it finds, so link in exactly the one
  # this family and model were set up with. The config is the recorded output of
-@@ -64,6 +79,44 @@ else
+@@ -64,6 +79,52 @@ else
    ln -sfn "$cfg" "/opt/strata/strata-$tag.json"
  fi
  
@@ -677,14 +684,18 @@ index 64d096b..291d099 100755
 +#  EXPERT_CACHE (auto | N): the engine's --expert-cache, the GPU's copy of the most-used experts in slots of one expert
 +#    each. auto takes the GPU memory left after the model loads; on a GPU that shares the RAM (DGX Spark) that is
 +#    MemAvailable less STRATA_UMA_HEADROOM_GIB, a second copy of experts already in RAM (docs/DGX_SPARK.md).
-+if [ -n "${MODEL_ALIASES:-}" ] || [ -n "${EXPERT_CACHE:-}" ]; then
-+  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
++#  PARALLEL (N): up to N requests decode together in the engine's batch slots, the config's "parallel"
++#    (docs/BATCHING.md); 1 is one at a time, more wait their turn. The server caps it at 8 and says so.
++if [ -n "${MODEL_ALIASES:-}" ] || [ -n "${EXPERT_CACHE:-}" ] || [ -n "${PARALLEL:-}" ]; then
++  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "${PARALLEL:-}" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
 +import json, os, sys
-+aliases, cache = sys.argv[1], sys.argv[2].strip().lower()
++aliases, cache, parallel = sys.argv[1], sys.argv[2].strip().lower(), sys.argv[3].strip()
 +if cache and cache != "auto" and not (cache.isdigit() and int(cache) > 0):
 +    sys.exit(f"EXPERT_CACHE={sys.argv[2]!r}: expected auto or a whole number of slots above 0 (the engine needs a cache)")
++if parallel and not (parallel.isdigit() and int(parallel) > 0):
++    sys.exit(f"PARALLEL={sys.argv[3]!r}: expected a whole number of requests at once, 1 or more (1: one at a time)")
 +names = [x.strip() for x in aliases.split(",") if x.strip()]
-+for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[3:] if os.path.isfile(p)):
++for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[4:] if os.path.isfile(p)):
 +    with open(path, encoding="utf-8-sig") as f:
 +        cfg = json.load(f)
 +    old = json.dumps(cfg)
@@ -697,6 +708,8 @@ index 64d096b..291d099 100755
 +        else:
 +            args += ["--expert-cache", cache]
 +        cfg["args"] = args
++    if parallel:
++        cfg["parallel"] = int(parallel)
 +    if json.dumps(cfg) != old:
 +        with open(path, "w", encoding="utf-8") as f:
 +            f.write(json.dumps(cfg, indent=1))
@@ -704,6 +717,8 @@ index 64d096b..291d099 100755
 +    print("Model aliases: " + (", ".join(names) or "none"))
 +if cache:
 +    print("Expert cache: " + cache)
++if parallel:
++    print(f"Requests at once: {int(parallel)}")
 +PYEOF
 +fi
 +
@@ -712,10 +727,10 @@ index 64d096b..291d099 100755
  # GPUS / GPU / LAYER_SPLIT are repeated on purpose. Given at the start they pin the
 diff --git a/docs/DGX_SPARK.md b/docs/DGX_SPARK.md
 new file mode 100644
-index 0000000..174870d
+index 0000000..d4bd062
 --- /dev/null
 +++ b/docs/DGX_SPARK.md
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,284 @@
 +# NVIDIA DGX Spark (GB10, aarch64): build from source
 +
 +This fork ports Strata to the NVIDIA DGX Spark: a 20-core ARM Grace CPU (aarch64, NEON/SVE2, no x86 instructions), a Blackwell
@@ -849,11 +864,14 @@ index 0000000..174870d
 +Its settings come from the environment or a `.env` file in the project root: `cp .env.example .env` and edit it. The
 +example lists every setting with what it does; `.env` holds the API key, so `.gitignore` and `.dockerignore` leave it out.
 +The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT` (`65536`), `VISION` (`no`), `API_KEY`,
-+`GGUF_DIR`, `KV`, `KV_STREAMING`, `LOW_RAM` (`auto`), `RESIDENT_BUDGET_GIB`, `MODEL_ALIASES`, `EXPERT_CACHE`,
++`GGUF_DIR`, `KV`, `KV_STREAMING`, `LOW_RAM` (`auto`), `RESIDENT_BUDGET_GIB`, `MODEL_ALIASES`, `EXPERT_CACHE`, `PARALLEL`,
 +`UMA_HEADROOM_GIB` (`6`), `REINSTALL`, `STRATA_BIND` (`127.0.0.1`), `STRATA_PORT` (`8080`), `ALLOWED_HOSTS`,
 +`BUILD_VISION` (`1`). `MODEL_ALIASES=qwen,local-model` gives the model other names: `/v1/models` lists them, and a
 +request naming one is answered under it. The entrypoint writes them into the config's `aliases` on every start (the
 +same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay.
++`PARALLEL=N` lets up to N requests decode together (the config's `"parallel"`, docs/BATCHING.md); more wait their turn.
++After setup it is one at a time. The entrypoint writes it into the config on every start, so it needs no `REINSTALL`.
++Not measured on the Spark yet.
 +
 +For GGUF files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container
 +runs as root, so the files it writes in `strata-data/` are owned by root.
@@ -1475,7 +1493,7 @@ index a78d088..5efb2df 100644
      int64_t K = 10;
      // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
 diff --git a/tools/test_docker_entrypoint.py b/tools/test_docker_entrypoint.py
-index 3e185a6..5850b5e 100644
+index 3e185a6..28fd690 100644
 --- a/tools/test_docker_entrypoint.py
 +++ b/tools/test_docker_entrypoint.py
 @@ -7,6 +7,7 @@ Windows).
@@ -1501,7 +1519,7 @@ index 3e185a6..5850b5e 100644
 -    def run_entry(self, reinstall):
 +    def run_entry(self, reinstall, rc=0, **extra):
          env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
-+        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "API_KEY", "STRATA_API_KEY", "STRATA_BIND"):   # only what the test sets
++        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "PARALLEL", "API_KEY", "STRATA_API_KEY", "STRATA_BIND"):   # only what the test sets
 +            env.pop(k, None)
 +        env.update(extra)
          r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
@@ -1515,7 +1533,7 @@ index 3e185a6..5850b5e 100644
  
      def test_edited_volume_config_wins_over_a_regular_file_in_opt(self):
          (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["edited", "--kv-resident", "32768"]}\n')
-@@ -62,6 +70,74 @@ class Entrypoint(unittest.TestCase):
+@@ -62,6 +70,92 @@ class Entrypoint(unittest.TestCase):
          cfg.write_text('{"args": ["edited-later"]}\n')
          self.assertIn("edited-later", self.run_entry("0"))           # the regular file setup left is replaced by the link
  
@@ -1558,6 +1576,24 @@ index 3e185a6..5850b5e 100644
 +            out = self.run_entry("0", rc=1, EXPERT_CACHE=bad)
 +            self.assertIn("EXPERT_CACHE", out)
 +            self.assertNotIn("STARTED WITH", out)
++            self.assertEqual(cfg.read_text(), text)
++
++    def test_parallel_sets_the_configs_requests_at_once(self):
++        cfg = self.data / "config" / "strata-iq3_s.json"
++        cfg.write_text('{"args": ["--expert-cache", "auto"], "parallel": 1}\n')
++        out = self.run_entry("0", PARALLEL=" 4 ")
++        self.assertIn("Requests at once: 4", out)
++        got = json.loads(cfg.read_text())
++        self.assertEqual(got["parallel"], 4)                        # a number, as the server expects
++        self.assertEqual(got["args"], ["--expert-cache", "auto"])
++
++    def test_bad_parallel_stops_the_start_and_changes_nothing(self):
++        cfg = self.data / "config" / "strata-iq3_s.json"
++        text = '{"args": [], "parallel": 2}\n'
++        cfg.write_text(text)
++        for bad in ("0", "-1", "two", "2.5"):
++            out = self.run_entry("0", rc=1, PARALLEL=bad)
++            self.assertIn("PARALLEL", out)
 +            self.assertEqual(cfg.read_text(), text)
 +
 +    def test_unset_model_aliases_leave_the_config_alone(self):
