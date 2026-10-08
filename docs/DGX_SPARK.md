@@ -165,7 +165,7 @@ lists. With UD-IQ4_XS that limit came first: the cache held all 24,576 experts (
 ## Applying the port to a newer upstream
 
 `patches/dgx-spark.patch` is the whole port as one patch against upstream `main` (Niko1221/Strata). It holds every change
-listed above, this document included. Applied to upstream commit `e8ca9af` it gives exactly this fork's tree.
+listed above, this document included. Applied to upstream commit `6674a00` (0.1.40.4) it gives exactly this fork's tree.
 
 On a fresh upstream checkout:
 
