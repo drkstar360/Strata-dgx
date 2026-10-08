@@ -22,6 +22,21 @@ LOW_RAM="${LOW_RAM:-auto}"      # on: the experts come from the pack's experts.b
 GGUF_DIR="${GGUF_DIR:-}"        # a mounted folder with GGUF files you already have: no download
 RESIDENT_BUDGET_GIB="${RESIDENT_BUDGET_GIB:-}"   # UD-Q4_K_XL: GiB of experts kept in RAM (default: setup's pick)
 KV_STREAMING="${KV_STREAMING:-}" # auto | on | off; empty: setup.py's own default (auto)
+STRATA_BIND="${STRATA_BIND:-127.0.0.1}"   # docker-compose.spark.yml: the host address the port is published on
+
+# Never reachable beyond this machine without an API key (AGENTS.md): docker-compose.spark.yml publishes the port on
+# STRATA_BIND, so any other address needs API_KEY. Checked first, before a setup pass downloads anything.
+case "$STRATA_BIND" in
+  127.0.0.1|localhost|::1) ;;
+  *) if [ -z "$(printf '%s' "$API_KEY" | tr -d ' \t\r\n')" ]; then
+       echo "STRATA_BIND=$STRATA_BIND publishes the server beyond this machine: set API_KEY too (clients send it as" >&2
+       echo "Authorization: Bearer <key> or x-api-key), or keep STRATA_BIND=127.0.0.1." >&2
+       exit 1
+     fi ;;
+esac
+# The key the server checks on every start (it reads STRATA_API_KEY before the config's), so a new key needs no setup
+# pass. Exported only when set: an empty STRATA_API_KEY stops the server (#213).
+if [ -n "$API_KEY" ]; then export STRATA_API_KEY="$API_KEY"; fi
 
 # setup.py starts the newest strata-*.json it finds, so link in exactly the one
 # this family and model were set up with. The config is the recorded output of

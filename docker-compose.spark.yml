@@ -12,7 +12,8 @@
 # Settings come from the environment or a .env file next to this one: `cp .env.example .env` and edit it (it lists
 # every setting with its default; .env is kept out of git and out of the image).
 # REINSTALL=1 changes the settings of a model that is already set up.  Q2_0 is not offered on ARM (its pack needs x86
-# AVX-512).  The port is published on 127.0.0.1 only: set API_KEY before opening it to a network.
+# AVX-512).  The port is published on STRATA_BIND, 127.0.0.1 by default (this machine only); STRATA_BIND=0.0.0.0 opens
+# it to the network and then needs API_KEY (the container refuses to start without one).
 
 services:
   strata:
@@ -26,7 +27,7 @@ services:
     container_name: strata
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${STRATA_PORT:-8080}:8080"
+      - "${STRATA_BIND:-127.0.0.1}:${STRATA_PORT:-8080}:8080"
     ulimits:
       memlock:                                     # the engine locks part of the RAM for the GPU
         soft: -1
@@ -41,6 +42,8 @@ services:
       CONTEXT: "${CONTEXT:-65536}"
       VISION: "${VISION:-no}"
       API_KEY: "${API_KEY:-}"
+      STRATA_BIND: "${STRATA_BIND:-127.0.0.1}"          # read by the entrypoint: another address needs API_KEY
+      STRATA_ALLOWED_HOSTS: "${ALLOWED_HOSTS:-}"        # host names clients use (an IP address always works)
       GGUF_DIR: "${GGUF_DIR:-}"
       KV: "${KV:-}"
       KV_STREAMING: "${KV_STREAMING:-}"
