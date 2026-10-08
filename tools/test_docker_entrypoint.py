@@ -31,7 +31,8 @@ class Entrypoint(unittest.TestCase):
         # the stub "python": setup.py --setup writes the config the way setup does; a plain start prints what it would load
         stub = self.opt / ".venv" / "bin" / "python"
         stub.write_text('#!/bin/sh\nif [ "$2" = "--setup" ]; then echo \'{"args": ["from-setup"]}\' > strata-iq3_s.json\n'
-                        'else echo "STARTED WITH: $(cat strata-iq3_s.json)"; fi\n', encoding="utf-8")
+                        'else echo "STARTED WITH: $(cat strata-iq3_s.json) KEY=${STRATA_API_KEY-unset}"; fi\n',
+                        encoding="utf-8")
         stub.chmod(0o755)
         script = (ROOT / "docker-entrypoint.sh").read_text(encoding="utf-8").replace("/opt/strata", str(self.opt))
         self.script = self.tmp / "entry.sh"
@@ -39,7 +40,7 @@ class Entrypoint(unittest.TestCase):
 
     def run_entry(self, reinstall, rc=0, **extra):
         env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
-        for k in ("MODEL_ALIASES", "EXPERT_CACHE"):                  # only what the test sets
+        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "API_KEY", "STRATA_API_KEY", "STRATA_BIND"):   # only what the test sets
             env.pop(k, None)
         env.update(extra)
         r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
@@ -116,6 +117,26 @@ class Entrypoint(unittest.TestCase):
         cfg.write_text(text)
         self.run_entry("0")
         self.assertEqual(cfg.read_text(), text)
+
+
+    def test_bind_beyond_this_machine_needs_an_api_key(self):
+        for bind in ("0.0.0.0", "192.168.1.210", "::"):
+            for key in ("", "   "):
+                out = self.run_entry("0", rc=1, STRATA_BIND=bind, API_KEY=key)
+                self.assertIn("set API_KEY", out)
+                self.assertNotIn("Setting up", out)                  # stopped before any setup pass or download
+                self.assertNotIn("STARTED WITH", out)
+
+    def test_bind_with_a_key_starts_and_hands_the_key_to_the_server(self):
+        (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["on-volume"]}\n')
+        out = self.run_entry("0", STRATA_BIND="0.0.0.0", API_KEY="s3cret")
+        self.assertIn("KEY=s3cret", out)
+
+    def test_localhost_bind_needs_no_key_and_sets_none(self):
+        (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["on-volume"]}\n')
+        for bind in (None, "127.0.0.1", "localhost"):
+            out = self.run_entry("0", **({} if bind is None else {"STRATA_BIND": bind}))
+            self.assertIn("KEY=unset", out)                          # an empty STRATA_API_KEY would stop the server
 
 
 if __name__ == "__main__":

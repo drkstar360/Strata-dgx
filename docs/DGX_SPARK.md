@@ -3,9 +3,10 @@
 This fork ports Strata to the NVIDIA DGX Spark: a 20-core ARM Grace CPU (aarch64, NEON/SVE2, no x86 instructions), a Blackwell
 GB10 GPU (compute capability 12.1, `sm_121`) and 128 GB of LPDDR5X that the CPU and the GPU share. Upstream Strata targets x86-64
 CPUs with discrete GPUs; every change for the Spark sits behind an aarch64 check, so the x86 build stays as it is (checked below).
-**Status: experimental, no model run yet.** The engine and setup's own engine build and pass the tests on the Spark; the API,
-output quality and speed have not been measured. Everything here was measured on one machine, a DGX Spark running DGX OS (Ubuntu
-24.04.5), driver 580.178.04, CUDA 13.0.88, GCC 13.3.0, on 2026-10-08.
+**Status: experimental, runs.** The engine builds and passes the tests on the Spark, and Unsloth's UD-IQ4_XS runs in the
+`Dockerfile.spark` image: every API and output check passed, at 25-37 tokens/s output and ~650 tokens/s prompt reading at 32K
+("Results so far"). Everything here was measured on one machine, a DGX Spark running DGX OS (Ubuntu 24.04.5), driver
+580.178.04, CUDA 13.0.88, GCC 13.3.0, on 2026-10-08.
 
 ## What the Spark reports
 
@@ -131,13 +132,20 @@ Its settings come from the environment or a `.env` file in the project root: `cp
 example lists every setting with what it does; `.env` holds the API key, so `.gitignore` and `.dockerignore` leave it out.
 The settings: `FAMILY` (default `unsloth`), `MODEL` (`UD-IQ4_XS`), `CONTEXT` (`65536`), `VISION` (`no`), `API_KEY`,
 `GGUF_DIR`, `KV`, `KV_STREAMING`, `LOW_RAM` (`auto`), `RESIDENT_BUDGET_GIB`, `MODEL_ALIASES`, `EXPERT_CACHE`,
-`UMA_HEADROOM_GIB` (`6`), `REINSTALL`, `STRATA_PORT` (`8080`),
+`UMA_HEADROOM_GIB` (`6`), `REINSTALL`, `STRATA_BIND` (`127.0.0.1`), `STRATA_PORT` (`8080`), `ALLOWED_HOSTS`,
 `BUILD_VISION` (`1`). `MODEL_ALIASES=qwen,local-model` gives the model other names: `/v1/models` lists them, and a
 request naming one is answered under it. The entrypoint writes them into the config's `aliases` on every start (the
 same key the web page's About tab edits; docs/DETAILS.md "Model aliases"). Left empty, the config's own aliases stay.
 
 For GGUF files already on the Spark, uncomment the `/ggufs` mount in the file and set `GGUF_DIR=/ggufs`. The container
 runs as root, so the files it writes in `strata-data/` are owned by root.
+
+**Reaching it from other machines.** The port is published on `STRATA_BIND`, `127.0.0.1` by default (the Spark only).
+`STRATA_BIND=0.0.0.0` publishes it on every network interface, so other machines reach `http://<the Spark's IP>:8080/v1`.
+Any address but `127.0.0.1` / `localhost` / `::1` needs `API_KEY`: the container stops with a message, before setup or any
+download, when it is empty. `API_KEY` reaches the server as `STRATA_API_KEY` on every start, so a new key needs no
+`REINSTALL`. A client that uses a host name instead of the IP (`spark-home.local`) needs it in `ALLOWED_HOSTS`: the server
+refuses unknown names, a guard against DNS rebinding.
 
 Two settings decide how much of the shared memory Strata takes:
 
@@ -146,10 +154,10 @@ Two settings decide how much of the shared memory Strata takes:
 - `UMA_HEADROOM_GIB` (default 6) is passed to the engine as `STRATA_UMA_HEADROOM_GIB`.
 
 With `auto`, the engine sizes the cache from `device_free_bytes()`, which on the Spark is `MemAvailable` less
-`UMA_HEADROOM_GIB`, read after the model has loaded (`src/program/generate.cpp`). The cache takes all of that, up to the
-number of experts the profile lists. So by default Strata should use nearly all memory but the headroom. Much of the
-cache is a second copy of experts that are already in RAM, which the Spark's GPU can read directly. This is read from
-the code, not measured; see "Not done yet".
+`UMA_HEADROOM_GIB`, read after the model has loaded (`src/program/generate.cpp`), up to the number of experts the profile
+lists. With UD-IQ4_XS that limit came first: the cache held all 24,576 experts (55.43 GiB) and 47 GiB stayed available
+("Model run" below). The cache is a second copy of experts the OS file cache also holds; whether it pays for itself is in
+"Not done yet".
 
 ## Applying the port to a newer upstream
 
@@ -199,6 +207,45 @@ their `compile_commands.json` compared. Both have the same 66 compile commands, 
 `STRATA_ENABLE_CUDA=OFF`, because that PC has no Windows SDK and CUDA's compiler check needs to link. A full x86 build has not
 been run.
 
+### Model run (Docker)
+
+`docker-compose.spark.yml` built the image on the Spark and ran setup in it unattended: Unsloth UD-IQ4_XS (94 GB download,
+SHA-256 checked), images on, an 8-bit KV cache with KV streaming (setup turned it on), `--expert-cache auto`, the MTP draft
+layer (`--spec 4`), context 165,536 tokens. The engine was ready about one minute after it started loading. The expert cache
+took **every expert**: "24576 experts, 55.43 GiB".
+
+`bench/spark/spark_check.py` against it, one request at a time, greedy (temperature 0), thinking off unless said:
+
+| Check | Result |
+| --- | --- |
+| `/health`, `/v1/models` | ok |
+| OpenAI chat, "17 * 23" | `391` |
+| OpenAI streaming | ok (chunks, then `[DONE]`) |
+| Anthropic `/v1/messages`, "6 * 7" | `42` |
+| A fact (the capital of Australia) | `Canberra` |
+| Arithmetic, 1234 + 5678 | `6912` |
+| Code: `is_prime`, run against 63 values and 7919 / 7917 | passes |
+| The same code prompt twice | identical output |
+| A trick question with thinking on (17 sheep, all but 9 run away) | `9` |
+| A code word hidden at 50% of a 32,340-token prompt | found |
+
+11 of 11 passed. Speed (the server's own `timings`):
+
+| Request | Prompt | Prompt read | Output | Output speed | Drafts accepted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Short prompt, a story | 33 tok | - | 600 tok | 25.6 tok/s | 300 / 530 |
+| Short prompt, code | 42 tok | - | 600 tok | 37.0 tok/s | 428 / 509 |
+| 32K prompt, recall | 32,340 tok | 638 tok/s | 11 tok | 29.4 tok/s | 9 / 9 |
+| 32K prompt, 500-token summary | 31,880 tok | 653 tok/s | 425 tok | 26.3 tok/s | 243 / 352 |
+
+A 32K prompt is read in about 50 seconds. Code is faster than prose because the draft layer's guesses are accepted more often
+(84% against 57%).
+
+Memory with the model loaded and idle (`free -g`): 74 GiB used, 50 GiB of file cache, **47 GiB available**. The expert cache's
+55 GiB is most of the 74 GiB used. The experts' RAM copy is read from the model files through the OS file cache, which Linux
+can reclaim, rather than kept as locked memory: `Mlocked` was 24 MB. The container's own count (`docker stats`) was 9.2 GiB:
+it does not include the GPU's allocations.
+
 ## Two findings
 
 - **GCC 13 does not know the GB10 cores.** `-mcpu=native` falls back to generic ARMv8: it defines 5 `__ARM_FEATURE_*` macros and
@@ -218,16 +265,16 @@ architecture, so x86 users are not affected. On aarch64 the 121 default is set b
 
 ## Not done yet
 
-- **A model run.** No model was downloaded. The API checks, temperature-0 output checks (code, a math answer, a 32K-token recall
-  test) and decode / prompt tok/s at a short prompt and at 32K are still to do.
-- **`Dockerfile.spark`** and **`docker-compose.spark.yml`** have not been built or run.
+- **A reference comparison.** The output checks above are sanity checks. The same prompts against an x86 Strata install of the
+  same pack would show whether the Spark's greedy output matches, token for token.
+- **Longer prompts.** Prompt reading and recall past 32K (128K, 200K) are not measured.
+- **The bare-metal install** (`./setup.sh` on the Spark) built its engine but has not served a model; the Docker image has.
 - **Pinning on unified memory.** The engine page-locks tens of GB of host RAM for the GPU (`cudaHostRegister`, `mlock`). On the
   Spark host and GPU memory are one pool, so this may be pointless. Startup time, peak RSS and tok/s with the pinning as it is,
   and with less (`STRATA_RESIDENT_PIN=0`, `STRATA_ARENA_LOCK=0`, `STRATA_ARENA_PIN_GIB`), are to be measured.
-- **The expert cache on unified memory.** `device_free_bytes()` already counts `MemAvailable` less `STRATA_UMA_HEADROOM_GIB`
-  (default 6) for any integrated GPU on Linux, on the CUDA path too (`src/core/expert_cache.cpp`, read, not measured). So
-  `--expert-cache auto` may copy experts that are already in the same RAM. Whether that helps or only uses memory is to be
-  measured: memory use and tok/s with `EXPERT_CACHE` at auto, at a few slot counts, and with more `UMA_HEADROOM_GIB`.
+- **The expert cache on unified memory.** With `auto` the cache holds every expert (55.43 GiB), a second copy of experts the
+  file cache also holds. Whether it is faster than a small cache, or none of it, is to be measured: tok/s and memory with
+  `EXPERT_CACHE` at auto and at a few slot counts.
 - **The mixed cores.** The 20 cores are 10 Cortex-X925 and 10 Cortex-A725, and the expert pool pins one worker per core. CPU expert
   work may wait on the slower cores. Not measured.
 - **Q2_0 as a native GGUF.** ggml has a NEON Q2_0 dot product, so the native Q2_0 GGUF (not the canonical pack) may run. Setup
