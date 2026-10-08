@@ -40,7 +40,7 @@ class Entrypoint(unittest.TestCase):
 
     def run_entry(self, reinstall, rc=0, **extra):
         env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
-        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "API_KEY", "STRATA_API_KEY", "STRATA_BIND"):   # only what the test sets
+        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "PARALLEL", "API_KEY", "STRATA_API_KEY", "STRATA_BIND"):   # only what the test sets
             env.pop(k, None)
         env.update(extra)
         r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
@@ -109,6 +109,24 @@ class Entrypoint(unittest.TestCase):
             out = self.run_entry("0", rc=1, EXPERT_CACHE=bad)
             self.assertIn("EXPERT_CACHE", out)
             self.assertNotIn("STARTED WITH", out)
+            self.assertEqual(cfg.read_text(), text)
+
+    def test_parallel_sets_the_configs_requests_at_once(self):
+        cfg = self.data / "config" / "strata-iq3_s.json"
+        cfg.write_text('{"args": ["--expert-cache", "auto"], "parallel": 1}\n')
+        out = self.run_entry("0", PARALLEL=" 4 ")
+        self.assertIn("Requests at once: 4", out)
+        got = json.loads(cfg.read_text())
+        self.assertEqual(got["parallel"], 4)                        # a number, as the server expects
+        self.assertEqual(got["args"], ["--expert-cache", "auto"])
+
+    def test_bad_parallel_stops_the_start_and_changes_nothing(self):
+        cfg = self.data / "config" / "strata-iq3_s.json"
+        text = '{"args": [], "parallel": 2}\n'
+        cfg.write_text(text)
+        for bad in ("0", "-1", "two", "2.5"):
+            out = self.run_entry("0", rc=1, PARALLEL=bad)
+            self.assertIn("PARALLEL", out)
             self.assertEqual(cfg.read_text(), text)
 
     def test_unset_model_aliases_leave_the_config_alone(self):

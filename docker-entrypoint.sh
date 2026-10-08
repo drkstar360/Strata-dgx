@@ -87,14 +87,18 @@ fi
 #  EXPERT_CACHE (auto | N): the engine's --expert-cache, the GPU's copy of the most-used experts in slots of one expert
 #    each. auto takes the GPU memory left after the model loads; on a GPU that shares the RAM (DGX Spark) that is
 #    MemAvailable less STRATA_UMA_HEADROOM_GIB, a second copy of experts already in RAM (docs/DGX_SPARK.md).
-if [ -n "${MODEL_ALIASES:-}" ] || [ -n "${EXPERT_CACHE:-}" ]; then
-  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
+#  PARALLEL (N): up to N requests decode together in the engine's batch slots, the config's "parallel"
+#    (docs/BATCHING.md); 1 is one at a time, more wait their turn. The server caps it at 8 and says so.
+if [ -n "${MODEL_ALIASES:-}" ] || [ -n "${EXPERT_CACHE:-}" ] || [ -n "${PARALLEL:-}" ]; then
+  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "${PARALLEL:-}" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
 import json, os, sys
-aliases, cache = sys.argv[1], sys.argv[2].strip().lower()
+aliases, cache, parallel = sys.argv[1], sys.argv[2].strip().lower(), sys.argv[3].strip()
 if cache and cache != "auto" and not (cache.isdigit() and int(cache) > 0):
     sys.exit(f"EXPERT_CACHE={sys.argv[2]!r}: expected auto or a whole number of slots above 0 (the engine needs a cache)")
+if parallel and not (parallel.isdigit() and int(parallel) > 0):
+    sys.exit(f"PARALLEL={sys.argv[3]!r}: expected a whole number of requests at once, 1 or more (1: one at a time)")
 names = [x.strip() for x in aliases.split(",") if x.strip()]
-for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[3:] if os.path.isfile(p)):
+for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[4:] if os.path.isfile(p)):
     with open(path, encoding="utf-8-sig") as f:
         cfg = json.load(f)
     old = json.dumps(cfg)
@@ -107,6 +111,8 @@ for path in dict.fromkeys(os.path.realpath(p) for p in sys.argv[3:] if os.path.i
         else:
             args += ["--expert-cache", cache]
         cfg["args"] = args
+    if parallel:
+        cfg["parallel"] = int(parallel)
     if json.dumps(cfg) != old:
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps(cfg, indent=1))
@@ -114,6 +120,8 @@ if aliases:
     print("Model aliases: " + (", ".join(names) or "none"))
 if cache:
     print("Expert cache: " + cache)
+if parallel:
+    print(f"Requests at once: {int(parallel)}")
 PYEOF
 fi
 
