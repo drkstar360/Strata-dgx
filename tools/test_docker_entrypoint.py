@@ -40,7 +40,8 @@ class Entrypoint(unittest.TestCase):
 
     def run_entry(self, reinstall, rc=0, **extra):
         env = dict(os.environ, STRATA_DATA=str(self.data), MODEL="IQ3_S", REINSTALL=reinstall)
-        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "PARALLEL", "API_KEY", "STRATA_API_KEY", "STRATA_BIND"):   # only what the test sets
+        for k in ("MODEL_ALIASES", "EXPERT_CACHE", "PARALLEL", "API_KEY", "STRATA_API_KEY", "STRATA_BIND",
+                  "CONFIG"):                                     # only what the test sets
             env.pop(k, None)
         env.update(extra)
         r = subprocess.run([SH, str(self.script)], env=env, capture_output=True, text=True, timeout=60)
@@ -69,6 +70,39 @@ class Entrypoint(unittest.TestCase):
         self.assertIn("from-setup", cfg.read_text())
         cfg.write_text('{"args": ["edited-later"]}\n')
         self.assertIn("edited-later", self.run_entry("0"))           # the regular file setup left is replaced by the link
+
+    def test_existing_link_into_the_data_config_dir_is_kept(self):      # a pod command that picked a config by linking
+        (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["plain"]}\n')
+        other = self.data / "config" / "strata-iq3_s.1x4.json"
+        other.write_text('{"args": ["batch8"]}\n')
+        os.symlink(other, self.opt / "strata-iq3_s.json")
+        out = self.run_entry("0")
+        self.assertIn("batch8", out)
+        self.assertNotIn("plain", out)
+        self.assertIn(f"Config: {other}", out)
+
+    def test_link_to_somewhere_else_is_replaced(self):
+        (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["on-volume"]}\n')
+        elsewhere = self.tmp / "elsewhere.json"
+        elsewhere.write_text('{"args": ["elsewhere"]}\n')
+        os.symlink(elsewhere, self.opt / "strata-iq3_s.json")
+        self.assertIn("on-volume", self.run_entry("0"))
+
+    def test_config_env_wins(self):
+        (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["plain"]}\n')
+        other = self.tmp / "mine.json"
+        other.write_text('{"args": ["mine"]}\n')
+        os.symlink(self.data / "config" / "strata-iq3_s.json", self.opt / "strata-iq3_s.json")
+        out = self.run_entry("0", CONFIG=str(other))
+        self.assertIn("mine", out)
+        self.assertNotIn("plain", out)
+        self.assertIn(f"Config: {other}", out)
+
+    def test_model_names_the_config_and_it_is_printed(self):
+        (self.data / "config" / "strata-iq3_s.json").write_text('{"args": ["by-model"]}\n')
+        out = self.run_entry("0")
+        self.assertIn("by-model", out)
+        self.assertIn(f"Config: {self.data}/config/strata-iq3_s.json", out)
 
     def test_model_aliases_reach_the_config_that_starts_on_the_first_setup(self):
         out = self.run_entry("0", MODEL_ALIASES=" qwen, local-model ,")
@@ -136,6 +170,16 @@ class Entrypoint(unittest.TestCase):
         self.run_entry("0")
         self.assertEqual(cfg.read_text(), text)
 
+    def test_settings_change_only_the_config_chosen_with_config(self):
+        own = self.data / "config" / "strata-iq3_s.json"
+        text = '{"args": ["plain"]}\n'
+        own.write_text(text)
+        other = self.tmp / "mine.json"
+        other.write_text('{"args": ["mine"]}\n')
+        out = self.run_entry("0", CONFIG=str(other), PARALLEL="3")
+        self.assertIn('"parallel": 3', out)                         # the config that starts has it
+        self.assertEqual(json.loads(other.read_text())["parallel"], 3)
+        self.assertEqual(own.read_text(), text)                      # MODEL's own config is not touched
 
     def test_bind_beyond_this_machine_needs_an_api_key(self):
         for bind in ("0.0.0.0", "192.168.1.210", "::"):
