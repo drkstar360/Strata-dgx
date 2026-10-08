@@ -22,6 +22,7 @@ LOW_RAM="${LOW_RAM:-auto}"      # on: the experts come from the pack's experts.b
 GGUF_DIR="${GGUF_DIR:-}"        # a mounted folder with GGUF files you already have: no download
 RESIDENT_BUDGET_GIB="${RESIDENT_BUDGET_GIB:-}"   # UD-Q4_K_XL: GiB of experts kept in RAM (default: setup's pick)
 KV_STREAMING="${KV_STREAMING:-}" # auto | on | off; empty: setup.py's own default (auto)
+CONFIG="${CONFIG:-}"            # a config file to start with (wins over MODEL's /data/config/strata-<model>.json)
 STRATA_BIND="${STRATA_BIND:-127.0.0.1}"   # docker-compose.spark.yml: the host address the port is published on
 
 # Never reachable beyond this machine without an API key (AGENTS.md): docker-compose.spark.yml publishes the port on
@@ -55,7 +56,23 @@ mkdir -p "$STRATA_DATA/config"
 # setup.py's own default. LOW_RAM is always passed: setup.py measures the PC's RAM
 # from /proc/meminfo, which in a container is the host's total, not the container's
 # limit, so a memory-capped container has to ask for the low-RAM mode itself.
-if [ "${REINSTALL:-0}" = "1" ] || [ ! -f "$cfg" ]; then
+#
+# Which config the server starts with (#1244): CONFIG when set; else a link in /opt/strata that already points
+# into $STRATA_DATA/config/ (a pod command that picked one by linking); else MODEL's strata-<model>.json.
+link="/opt/strata/strata-$tag.json"
+keep=""
+if [ -n "$CONFIG" ]; then
+  [ -f "$CONFIG" ] || { echo "CONFIG=$CONFIG does not exist." >&2; exit 1; }
+elif [ "${REINSTALL:-0}" != "1" ] && [ -L "$link" ] && [ -f "$link" ]; then
+  case "$(readlink "$link")" in "$STRATA_DATA"/config/*) keep=1 ;; esac
+fi
+
+if [ -n "$CONFIG" ]; then
+  ln -sfn "$CONFIG" "$link"
+  echo "Config: $CONFIG (from CONFIG)"
+elif [ -n "$keep" ]; then
+  echo "Config: $(readlink "$link") (existing link kept)"
+elif [ "${REINSTALL:-0}" = "1" ] || [ ! -f "$cfg" ]; then
   if [ -n "$GGUF_DIR" ]; then
     echo "Setting up $tag from the GGUF files in $GGUF_DIR (the engine is already in the image)."
   else
@@ -73,15 +90,18 @@ if [ "${REINSTALL:-0}" = "1" ] || [ ! -f "$cfg" ]; then
   if [ -n "$KV_STREAMING" ]; then set -- "$@" --kv-streaming "$KV_STREAMING"; fi
   .venv/bin/python setup.py --setup --yes "$@"
   [ -e "/opt/strata/strata-$tag.json" ] && { cmp -s "/opt/strata/strata-$tag.json" "$cfg" || cp -f "/opt/strata/strata-$tag.json" "$cfg"; }
+  echo "Config: $cfg (from MODEL $MODEL, just set up)"
 else
   # #1244: the copy on the volume is the one that counts, so a regular file left in /opt/strata by an earlier setup
   # (or by an image built with one) must not stand in for it: edits to /data/config would be ignored
   ln -sfn "$cfg" "/opt/strata/strata-$tag.json"
+  echo "Config: $cfg (from MODEL $MODEL)"
 fi
 
-# Settings applied to the model's config on every start, after any setup pass (which rewrites the engine's args), in
-# the config on the volume and in the one that starts (a copy after a setup pass, else the link to it). Unset, the
-# config's own value stays (what the web page or an earlier start wrote).
+# Settings applied on every start, after any setup pass (which rewrites the engine's args), to the config that starts
+# (the file the link points to, or the copy a setup pass left) and, when that is MODEL's own, to its copy on the volume.
+# A config chosen with CONFIG or a kept link is the only one changed. Unset, the config's own value stays (what the web
+# page or an earlier start wrote).
 #  MODEL_ALIASES ("qwen,local-model"): other names the model answers to and /v1/models lists (the config's "aliases",
 #    docs/DETAILS.md "Model aliases").
 #  EXPERT_CACHE (auto | N): the engine's --expert-cache, the GPU's copy of the most-used experts in slots of one expert
@@ -90,7 +110,8 @@ fi
 #  PARALLEL (N): up to N requests decode together in the engine's batch slots, the config's "parallel"
 #    (docs/BATCHING.md); 1 is one at a time, more wait their turn. The server caps it at 8 and says so.
 if [ -n "${MODEL_ALIASES:-}" ] || [ -n "${EXPERT_CACHE:-}" ] || [ -n "${PARALLEL:-}" ]; then
-  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "${PARALLEL:-}" "$cfg" "/opt/strata/strata-$tag.json" <<'PYEOF'
+  if [ -n "$CONFIG" ] || [ -n "$keep" ]; then also="$link"; else also="$cfg"; fi
+  python3 - "${MODEL_ALIASES:-}" "${EXPERT_CACHE:-}" "${PARALLEL:-}" "$link" "$also" <<'PYEOF'
 import json, os, sys
 aliases, cache, parallel = sys.argv[1], sys.argv[2].strip().lower(), sys.argv[3].strip()
 if cache and cache != "auto" and not (cache.isdigit() and int(cache) > 0):

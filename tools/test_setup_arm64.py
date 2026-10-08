@@ -64,7 +64,8 @@ class Arm64Test(unittest.TestCase):
         self.assertTrue(g["uma"])
         self.assertAlmostEqual(g["vram_gb"], SPARK_RAM - setup.UMA_OS_LEFT_GB)
         self.assertEqual(setup.low_ram_vram(g), 0.0)          # the RAM is not counted twice
-        self.assertTrue(setup.strix_halo_recommends(g, SPARK_RAM))   # UD-IQ4_XS fits in the shared memory
+        self.assertTrue(setup.spark_recommends(g, SPARK_RAM))        # UD-IQ4_XS fits in the shared memory
+        self.assertFalse(setup.strix_halo_recommends(g, SPARK_RAM))  # upstream keeps that one to real Strix Halo
 
     def test_no_ready_made_engine(self):
         self.assertIsNone(setup.get_prebuilt("https://example.invalid/", {"arch": "121"}, False))
@@ -81,6 +82,11 @@ class X86UnchangedTest(unittest.TestCase):
             g = setup.gpus()[0]
         self.assertNotIn("uma", g)
         self.assertAlmostEqual(g["vram_gb"], 32607 / 1024.0)
+
+    def test_no_spark_recommendation_on_x86(self):
+        g = {"index": 0, "name": "AMD Radeon 8060S", "uma": True, "dedicated_gb": 2.0, "vram_gb": 66.0, "arch": "gfx1151"}
+        with mock.patch.object(setup, "ARM64", False):
+            self.assertFalse(setup.spark_recommends(g, SPARK_RAM))
 
     def test_x86_floor_unchanged(self):
         with mock.patch.object(setup, "ARM64", False), mock.patch.dict(os.environ, {"STRATA_ISA_FLOOR": ""}):
